@@ -25,8 +25,9 @@ from ..config import RobotConfig
 class SOFollowerConfig:
     """Base configuration class for SO Follower robots."""
 
-    # Port to connect to the arm
-    port: str
+    # Port to connect to the arm. If omitted, resolved from the device registry
+    # via the robot's ``id`` (see `lerobot-register-device`).
+    port: str | None = None
 
     disable_torque_on_disconnect: bool = True
 

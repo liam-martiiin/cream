@@ -32,7 +32,7 @@ LeRobot = **datasets + policies + envs + robot control**, unified by a small set
 - **Policies** (`ACT`, `Diffusion`, `SmolVLA`, `π0`, `π0.5`, `Wall-X`, `X-VLA`, `VQ-BeT`, `TD-MPC`, …) — all inherit `PreTrainedPolicy` and can be pushed/pulled from the Hub.
 - **Processors** — small composable transforms between dataset → policy → robot.
 - **Envs** (sim) and **Robots** (real) — same action/observation contract so code swaps cleanly.
-- **CLI** — `lerobot-record`, `lerobot-train`, `lerobot-eval`, `lerobot-teleoperate`, `lerobot-calibrate`, `lerobot-find-port`, `lerobot-setup-motors`, `lerobot-replay`.
+- **CLI** — `lerobot-record`, `lerobot-train`, `lerobot-eval`, `lerobot-teleoperate`, `lerobot-calibrate`, `lerobot-find-port`, `lerobot-register-device`, `lerobot-setup-motors`, `lerobot-replay`.
 
 See [`AGENTS.md`](./AGENTS.md) for repo architecture.
 
@@ -71,13 +71,18 @@ hf auth login                               # required to push datasets/policies
 
 Contributors can alternatively use `uv sync --locked --extra feetech` (see `AGENTS.md`).
 
-**4.2 Find USB ports** — run once per arm, unplug when prompted.
+**4.2 Register each arm by its USB board serial** (recommended, one-time)
+
+Each SO-101 controller board has a factory-burned USB serial number that persists across reboots and replugs. Pair each board to a friendly name once and you can drop `--robot.port` / `--teleop.port` from every command below — IDs resolve automatically. Cable mismatches (e.g. cables swapped between arms) also become a hard error instead of a silent calibration mismatch.
 
 ```bash
-lerobot-find-port
+lerobot-register-device --type so101_leader   --name my_leader
+lerobot-register-device --type so101_follower --name my_follower
 ```
 
-macOS: `/dev/tty.usbmodem...`; Linux: `/dev/ttyACM0` (may need `sudo chmod 666 /dev/ttyACM0`).
+The script lists every connected SO-101 board with its serial, asks which is which, and offers to launch calibration immediately. Pairings are saved to `$HF_LEROBOT_CALIBRATION/devices.json`.
+
+> Prefer raw port paths instead? `lerobot-find-port` (unplug the cable when prompted) still works and the `--robot.port=...` examples below are equivalent. macOS: `/dev/tty.usbmodem...`; Linux: `/dev/ttyACM0` (may need `sudo chmod 666 /dev/ttyACM0` or your user in the `dialout` group).
 
 **4.3 Setup motor IDs & baudrate** (one-time, per arm)
 
@@ -86,19 +91,24 @@ lerobot-setup-motors --robot.type=so101_follower --robot.port=<FOLLOWER_PORT>
 lerobot-setup-motors --teleop.type=so101_leader  --teleop.port=<LEADER_PORT>
 ```
 
-**4.4 Calibrate** — center all joints, press Enter, sweep each joint through its full range. The `id` is the calibration key — reuse it everywhere.
+**4.4 Calibrate** — center all joints, press Enter, sweep each joint through its full range. The `id` is the calibration key — reuse it everywhere. (Skip if you accepted the prompt at the end of 4.2.)
 
 ```bash
-lerobot-calibrate --robot.type=so101_follower --robot.port=<FOLLOWER_PORT> --robot.id=my_follower
-lerobot-calibrate --teleop.type=so101_leader  --teleop.port=<LEADER_PORT>   --teleop.id=my_leader
+# After register-device (recommended):
+lerobot-calibrate --robot.type=so101_follower --robot.id=my_follower
+lerobot-calibrate --teleop.type=so101_leader  --teleop.id=my_leader
+
+# Or with explicit ports:
+# lerobot-calibrate --robot.type=so101_follower --robot.port=<FOLLOWER_PORT> --robot.id=my_follower
+# lerobot-calibrate --teleop.type=so101_leader  --teleop.port=<LEADER_PORT>   --teleop.id=my_leader
 ```
 
 **4.5 Teleoperate** (sanity check, no recording)
 
 ```bash
 lerobot-teleoperate \
-  --robot.type=so101_follower --robot.port=<FOLLOWER_PORT> --robot.id=my_follower \
-  --teleop.type=so101_leader  --teleop.port=<LEADER_PORT>  --teleop.id=my_leader \
+  --robot.type=so101_follower --robot.id=my_follower \
+  --teleop.type=so101_leader  --teleop.id=my_leader \
   --robot.cameras="{ front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}" \
   --display_data=true
 ```
@@ -117,8 +127,8 @@ lerobot-teleoperate \
 HF_USER=$(NO_COLOR=1 hf auth whoami | awk -F': *' 'NR==1 {print $2}')
 
 lerobot-record \
-  --robot.type=so101_follower --robot.port=<FOLLOWER_PORT> --robot.id=my_follower \
-  --teleop.type=so101_leader  --teleop.port=<LEADER_PORT>  --teleop.id=my_leader \
+  --robot.type=so101_follower --robot.id=my_follower \
+  --teleop.type=so101_leader  --teleop.id=my_leader \
   --robot.cameras="{ front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}" \
   --dataset.repo_id=${HF_USER}/my_task \
   --dataset.single_task="<describe the task in one sentence>" \
@@ -134,7 +144,7 @@ After upload: https://huggingface.co/spaces/lerobot/visualize_dataset → paste 
 **4.8 Replay an episode** (sanity check)
 
 ```bash
-lerobot-replay --robot.type=so101_follower --robot.port=<FOLLOWER_PORT> --robot.id=my_follower \
+lerobot-replay --robot.type=so101_follower --robot.id=my_follower \
   --dataset.repo_id=${HF_USER}/my_task --dataset.episode=0
 ```
 
@@ -156,7 +166,7 @@ lerobot-train \
 
 ```bash
 lerobot-record \
-  --robot.type=so101_follower --robot.port=<FOLLOWER_PORT> --robot.id=my_follower \
+  --robot.type=so101_follower --robot.id=my_follower \
   --robot.cameras="{ front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}" \
   --dataset.repo_id=${HF_USER}/eval_my_task \
   --dataset.single_task="<same task description as training>" \
@@ -342,7 +352,7 @@ Reuse `lerobot-record` with `--policy.path` to run the trained policy on-robot a
 
 ```bash
 lerobot-record \
-  --robot.type=so101_follower --robot.port=<FOLLOWER_PORT> --robot.id=my_follower \
+  --robot.type=so101_follower --robot.id=my_follower \
   --robot.cameras="{ front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}" \
   --dataset.repo_id=${HF_USER}/eval_my_task \
   --dataset.single_task="<same task description used during training>" \

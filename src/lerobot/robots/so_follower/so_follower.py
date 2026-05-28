@@ -26,6 +26,7 @@ from lerobot.motors.feetech import (
 )
 from lerobot.types import RobotAction, RobotObservation
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
+from lerobot.utils.device_registry import resolve_or_verify_port
 
 from ..robot import Robot
 from ..utils import ensure_safe_goal_position
@@ -46,6 +47,9 @@ class SOFollower(Robot):
     def __init__(self, config: SOFollowerRobotConfig):
         super().__init__(config)
         self.config = config
+        self.config.port = resolve_or_verify_port(
+            self.id, self.config.port, register_command_hint="--type so101_follower"
+        )
         # choose normalization mode depending on config if available
         norm_mode_body = MotorNormMode.DEGREES if config.use_degrees else MotorNormMode.RANGE_M100_100
         self.bus = FeetechMotorsBus(

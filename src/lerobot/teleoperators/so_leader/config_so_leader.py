@@ -23,8 +23,9 @@ from ..config import TeleoperatorConfig
 class SOLeaderConfig:
     """Base configuration class for SO Leader teleoperators."""
 
-    # Port to connect to the arm
-    port: str
+    # Port to connect to the arm. If omitted, resolved from the device registry
+    # via the teleop's ``id`` (see `lerobot-register-device`).
+    port: str | None = None
 
     # Whether to use degrees for angles
     use_degrees: bool = True

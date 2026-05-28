@@ -23,6 +23,7 @@ from lerobot.motors.feetech import (
     OperatingMode,
 )
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
+from lerobot.utils.device_registry import resolve_or_verify_port
 
 from ..teleoperator import Teleoperator
 from .config_so_leader import SOLeaderTeleopConfig
@@ -39,6 +40,9 @@ class SOLeader(Teleoperator):
     def __init__(self, config: SOLeaderTeleopConfig):
         super().__init__(config)
         self.config = config
+        self.config.port = resolve_or_verify_port(
+            self.id, self.config.port, register_command_hint="--type so101_leader"
+        )
         norm_mode_body = MotorNormMode.DEGREES if config.use_degrees else MotorNormMode.RANGE_M100_100
         self.bus = FeetechMotorsBus(
             port=self.config.port,
