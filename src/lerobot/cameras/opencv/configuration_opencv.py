@@ -42,7 +42,10 @@ class OpenCVCameraConfig(CameraConfig):
 
     Attributes:
         index_or_path: Either an integer representing the camera device index,
-                      or a Path object pointing to a video file.
+                      or a Path object pointing to a video file. Mutually exclusive with ``id``.
+        id: Friendly name from the camera registry (set up via ``lerobot-register-camera``).
+                      Mutually exclusive with ``index_or_path``. When set, the camera's
+                      device path is resolved at construction time via :pyclass:`CameraRegistry`.
         fps: Requested frames per second for the color stream.
         width: Requested frame width in pixels for the color stream.
         height: Requested frame height in pixels for the color stream.
@@ -53,17 +56,19 @@ class OpenCVCameraConfig(CameraConfig):
         backend: OpenCV backend identifier (https://docs.opencv.org/3.4/d4/d15/group__videoio__flags__base.html). Defaults to ANY.
 
     Note:
+        - Exactly one of ``id`` or ``index_or_path`` must be provided.
         - Only 3-channel color output (RGB/BGR) is currently supported.
         - FOURCC codes must be 4-character strings (e.g., "MJPG", "YUYV"). Some common FOUCC codes: https://learn.microsoft.com/en-us/windows/win32/medfound/video-fourccs#fourcc-constants
         - Setting FOURCC can help achieve higher frame rates on some cameras.
     """
 
-    index_or_path: int | Path
+    index_or_path: int | Path | None = None
     color_mode: ColorMode = ColorMode.RGB
     rotation: Cv2Rotation = Cv2Rotation.NO_ROTATION
     warmup_s: int = 1
     fourcc: str | None = None
     backend: Cv2Backends = Cv2Backends.ANY
+    id: str | None = None
 
     def __post_init__(self) -> None:
         self.color_mode = ColorMode(self.color_mode)
@@ -73,4 +78,13 @@ class OpenCVCameraConfig(CameraConfig):
         if self.fourcc is not None and (not isinstance(self.fourcc, str) or len(self.fourcc) != 4):
             raise ValueError(
                 f"`fourcc` must be a 4-character string (e.g., 'MJPG', 'YUYV'), but '{self.fourcc}' is provided."
+            )
+
+        has_id = self.id is not None
+        has_path = self.index_or_path is not None
+        if has_id == has_path:
+            raise ValueError(
+                "OpenCVCameraConfig requires exactly one of `id` (resolved via the camera "
+                "registry — see `lerobot-register-camera`) or `index_or_path` (raw OpenCV "
+                "index or /dev/video* path)."
             )

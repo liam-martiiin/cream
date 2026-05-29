@@ -102,7 +102,16 @@ class OpenCVCamera(Camera):
         super().__init__(config)
 
         self.config = config
-        self.index_or_path = config.index_or_path
+        if config.id is not None:
+            # Resolve a friendly name from the registry to a concrete /dev/video* path.
+            # Imported lazily so users not on the registry don't pay the cost (and so
+            # tests that don't touch the registry don't need to mock it).
+            from lerobot.utils.camera_picker import pick_camera
+            from lerobot.utils.camera_registry import CameraRegistry
+
+            self.index_or_path = CameraRegistry.load().resolve(config.id, picker=pick_camera)
+        else:
+            self.index_or_path = config.index_or_path
 
         self.fps = config.fps
         self.color_mode = config.color_mode

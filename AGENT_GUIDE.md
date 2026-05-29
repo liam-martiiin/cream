@@ -32,7 +32,7 @@ LeRobot = **datasets + policies + envs + robot control**, unified by a small set
 - **Policies** (`ACT`, `Diffusion`, `SmolVLA`, `π0`, `π0.5`, `Wall-X`, `X-VLA`, `VQ-BeT`, `TD-MPC`, …) — all inherit `PreTrainedPolicy` and can be pushed/pulled from the Hub.
 - **Processors** — small composable transforms between dataset → policy → robot.
 - **Envs** (sim) and **Robots** (real) — same action/observation contract so code swaps cleanly.
-- **CLI** — `lerobot-record`, `lerobot-train`, `lerobot-eval`, `lerobot-teleoperate`, `lerobot-calibrate`, `lerobot-find-port`, `lerobot-register-device`, `lerobot-setup-motors`, `lerobot-replay`.
+- **CLI** — `lerobot-record`, `lerobot-train`, `lerobot-eval`, `lerobot-teleoperate`, `lerobot-calibrate`, `lerobot-find-port`, `lerobot-register-device`, `lerobot-register-camera`, `lerobot-setup-motors`, `lerobot-replay`.
 
 See [`AGENTS.md`](./AGENTS.md) for repo architecture.
 
@@ -84,6 +84,17 @@ The script lists every connected SO-101 board with its serial, asks which is whi
 
 > Prefer raw port paths instead? `lerobot-find-port` (unplug the cable when prompted) still works and the `--robot.port=...` examples below are equivalent. macOS: `/dev/tty.usbmodem...`; Linux: `/dev/ttyACM0` (may need `sudo chmod 666 /dev/ttyACM0` or your user in the `dialout` group).
 
+**4.2.5 Register each camera by name** (recommended, one-time, optional)
+
+Cheap UVC webcams often ship with identical USB serial numbers (e.g. every Innomaker U20CAM reports `SN0001`), so OpenCV indices reshuffle on reboot. `lerobot-register-camera` opens an interactive picker — a grid of live previews if a display is available, a numbered text list otherwise — and binds each physical camera to a friendly name. From then on you can use `id` instead of `index_or_path` in the `--robot.cameras=` JSON.
+
+```bash
+lerobot-register-camera --name right_overhead
+lerobot-register-camera --name workspace_top
+```
+
+Pairings are saved to `$HF_LEROBOT_CALIBRATION/cameras.json`. The grid view requires the full `opencv-python` package (the default `opencv-python-headless` has no GUI); the text-mode fallback works either way and is auto-selected over SSH. If you swap which port a camera is plugged into, the next command that uses it will re-prompt the picker on the spot to re-bind, no manual re-registration needed.
+
 **4.3 Setup motor IDs & baudrate** (one-time, per arm)
 
 ```bash
@@ -109,8 +120,10 @@ lerobot-calibrate --teleop.type=so101_leader  --teleop.id=my_leader
 lerobot-teleoperate \
   --robot.type=so101_follower --robot.id=my_follower \
   --teleop.type=so101_leader  --teleop.id=my_leader \
-  --robot.cameras="{ front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}" \
+  --robot.cameras="{ front: {type: opencv, id: workspace_top, width: 640, height: 480, fps: 30}}" \
   --display_data=true
+# Or with raw OpenCV index (no register-camera step needed, but unstable across reboots):
+#   --robot.cameras="{ front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}"
 ```
 
 > **Feetech timeout / comms error on SO-100 / SO-101?** Before touching software, check the **red motor LEDs** on the daisy chain.
@@ -129,7 +142,7 @@ HF_USER=$(NO_COLOR=1 hf auth whoami | awk -F': *' 'NR==1 {print $2}')
 lerobot-record \
   --robot.type=so101_follower --robot.id=my_follower \
   --teleop.type=so101_leader  --teleop.id=my_leader \
-  --robot.cameras="{ front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}" \
+  --robot.cameras="{ front: {type: opencv, id: workspace_top, width: 640, height: 480, fps: 30}}" \
   --dataset.repo_id=${HF_USER}/my_task \
   --dataset.single_task="<describe the task in one sentence>" \
   --dataset.num_episodes=50 \
@@ -167,7 +180,7 @@ lerobot-train \
 ```bash
 lerobot-record \
   --robot.type=so101_follower --robot.id=my_follower \
-  --robot.cameras="{ front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}" \
+  --robot.cameras="{ front: {type: opencv, id: workspace_top, width: 640, height: 480, fps: 30}}" \
   --dataset.repo_id=${HF_USER}/eval_my_task \
   --dataset.single_task="<same task description as training>" \
   --dataset.num_episodes=10 \
@@ -353,7 +366,7 @@ Reuse `lerobot-record` with `--policy.path` to run the trained policy on-robot a
 ```bash
 lerobot-record \
   --robot.type=so101_follower --robot.id=my_follower \
-  --robot.cameras="{ front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}" \
+  --robot.cameras="{ front: {type: opencv, id: workspace_top, width: 640, height: 480, fps: 30}}" \
   --dataset.repo_id=${HF_USER}/eval_my_task \
   --dataset.single_task="<same task description used during training>" \
   --dataset.num_episodes=10 \
