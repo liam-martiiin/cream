@@ -30,6 +30,18 @@ logger = logging.getLogger(__name__)
 class BiSOFollower(Robot):
     """
     [Bimanual SO Follower Arms](https://github.com/TheRobotStudio/SO-ARM100) designed by TheRobotStudio
+
+    Composes two single-arm :class:`SOFollower` instances. Each sub-arm is given a
+    ``{id}_left`` / ``{id}_right`` id, so the per-arm port is resolved from (or
+    verified against) the device registry exactly like a single SO follower. To use
+    serial-number resolution instead of ``--robot.<side>_arm_config.port`` flags,
+    register both boards once::
+
+        lerobot-register-device --type so101_follower --name <id>_left
+        lerobot-register-device --type so101_follower --name <id>_right
+
+    then pass ``--robot.id=<id>`` and omit the ports. See
+    :func:`lerobot.utils.device_registry.resolve_or_verify_port`.
     """
 
     config_class = BiSOFollowerConfig
@@ -154,5 +166,9 @@ class BiSOFollower(Robot):
 
     @check_if_not_connected
     def disconnect(self):
-        self.left_arm.disconnect()
-        self.right_arm.disconnect()
+        # Disconnect both arms even if the first one raises, so a failure on one
+        # arm can't leave the other connected (and possibly torque-on).
+        try:
+            self.left_arm.disconnect()
+        finally:
+            self.right_arm.disconnect()

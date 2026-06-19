@@ -297,3 +297,53 @@ def test_rotation(rotation, index_or_path):
             assert camera.width == original_width
             assert camera.height == original_height
             assert img.shape[:2] == (original_height, original_width)
+
+
+def test_validate_dimensions_trust_readback_when_set_returns_false():
+    """Some V4L2/GStreamer drivers return False from set() but apply the value.
+    Validation must trust the read-back and not raise when the actual size matches."""
+    from unittest.mock import MagicMock
+
+    config = OpenCVCameraConfig(index_or_path=0, width=640, height=480, fps=30)
+    camera = OpenCVCamera(config)
+
+    vc = MagicMock()
+    vc.set.return_value = False  # driver claims failure ...
+    vc.get.side_effect = lambda prop: {
+        cv2.CAP_PROP_FRAME_WIDTH: 640.0,
+        cv2.CAP_PROP_FRAME_HEIGHT: 480.0,
+        cv2.CAP_PROP_FPS: 30.0,
+    }[prop]
+    camera.videocapture = vc
+    camera.capture_width, camera.capture_height = 640, 480
+    camera.fps = 30
+
+    # ... but the read-back matches, so neither should raise.
+    camera._validate_width_and_height()
+    camera._validate_fps()
+
+
+def test_validate_dimensions_raises_on_real_mismatch():
+    """When the actual size genuinely differs from requested, it must still raise."""
+    from unittest.mock import MagicMock
+
+    config = OpenCVCameraConfig(index_or_path=0, width=640, height=480)
+    camera = OpenCVCamera(config)
+
+    vc = MagicMock()
+    vc.set.return_value = True
+    vc.get.return_value = 320.0  # actual != requested
+    camera.videocapture = vc
+    camera.capture_width, camera.capture_height = 640, 480
+
+    with pytest.raises(RuntimeError):
+        camera._validate_width_and_height()
+
+
+def test_default_backend_is_any():
+    """Default backend stays ANY so file-based captures keep working; users pass
+    backend=V4L2 explicitly for the most reliable /dev/video* control on Linux."""
+    from lerobot.cameras.configs import Cv2Backends
+
+    config = OpenCVCameraConfig(index_or_path=0)
+    assert config.backend == Cv2Backends.ANY

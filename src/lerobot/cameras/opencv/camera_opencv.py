@@ -106,10 +106,12 @@ class OpenCVCamera(Camera):
             # Resolve a friendly name from the registry to a concrete /dev/video* path.
             # Imported lazily so users not on the registry don't pay the cost (and so
             # tests that don't touch the registry don't need to mock it).
-            from lerobot.utils.camera_picker import pick_camera
+            # picker=None: during normal operation an unresolvable name must raise a
+            # clear error, never pop an interactive grid. Interactive picking is the
+            # exclusive job of `lerobot-register-camera`.
             from lerobot.utils.camera_registry import CameraRegistry
 
-            self.index_or_path = CameraRegistry.load().resolve(config.id, picker=pick_camera)
+            self.index_or_path = CameraRegistry.load().resolve(config.id, picker=None)
         else:
             self.index_or_path = config.index_or_path
 
@@ -248,9 +250,12 @@ class OpenCVCamera(Camera):
 
         success = self.videocapture.set(cv2.CAP_PROP_FPS, float(self.fps))
         actual_fps = self.videocapture.get(cv2.CAP_PROP_FPS)
-        # Use math.isclose for robust float comparison
-        if not success or not math.isclose(self.fps, actual_fps, rel_tol=1e-3):
-            raise RuntimeError(f"{self} failed to set fps={self.fps} ({actual_fps=}).")
+        # Trust the read-back: some V4L2/GStreamer drivers return False from set() but
+        # still apply the value. Fail only on an actual mismatch (math.isclose for floats).
+        if not math.isclose(self.fps, actual_fps, rel_tol=1e-3):
+            raise RuntimeError(f"{self} failed to set fps={self.fps} ({actual_fps=}, {success=}).")
+        if not success:
+            logger.debug(f"{self} set(fps={self.fps}) returned False but read-back matches; continuing.")
 
     def _validate_fourcc(self) -> None:
         """Validates and sets the camera's FOURCC code."""
@@ -285,16 +290,27 @@ class OpenCVCamera(Camera):
         width_success = self.videocapture.set(cv2.CAP_PROP_FRAME_WIDTH, float(self.capture_width))
         height_success = self.videocapture.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self.capture_height))
 
+        # Trust the read-back as authoritative: some V4L2/GStreamer drivers return
+        # False from set() yet still apply the requested value. Fail only on a real
+        # mismatch between requested and actual.
         actual_width = int(round(self.videocapture.get(cv2.CAP_PROP_FRAME_WIDTH)))
-        if not width_success or self.capture_width != actual_width:
+        if self.capture_width != actual_width:
             raise RuntimeError(
                 f"{self} failed to set capture_width={self.capture_width} ({actual_width=}, {width_success=})."
             )
+        if not width_success:
+            logger.debug(
+                f"{self} set(width={self.capture_width}) returned False but read-back matches; continuing."
+            )
 
         actual_height = int(round(self.videocapture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
-        if not height_success or self.capture_height != actual_height:
+        if self.capture_height != actual_height:
             raise RuntimeError(
                 f"{self} failed to set capture_height={self.capture_height} ({actual_height=}, {height_success=})."
+            )
+        if not height_success:
+            logger.debug(
+                f"{self} set(height={self.capture_height}) returned False but read-back matches; continuing."
             )
 
     @staticmethod

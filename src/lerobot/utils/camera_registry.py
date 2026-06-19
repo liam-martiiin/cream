@@ -13,19 +13,24 @@
 # limitations under the License.
 
 """
-Camera registry mapping friendly names to physical UVC cameras.
+Camera registry mapping friendly names to physical cameras.
 
-Where the SO-101 controller boards have unique USB serial numbers, cheap UVC
-webcams (e.g. the Innomaker U20CAM line) frequently ship every unit with the
-same hardcoded ``iSerial = SN0001``. That makes ``(vid, pid, serial)`` alone
-insufficient to distinguish multiple identical cameras.
+Each entry carries a ``kind``:
 
-This module uses a **compound key**: ``(vid, pid, serial, usb_path)``. The
-``usb_path`` is the physical USB topology (which hub, which port). It survives
-reboots but breaks when a cable moves to a different port. We treat it as a
-fast-path hint and recover with a user-supplied picker when it goes stale.
+- ``"opencv"`` — a UVC/V4L2 webcam, resolved to a ``/dev/video*`` capture node.
+- ``"intelrealsense"`` — an Intel RealSense, resolved (via the pyrealsense2 SDK)
+  to its globally-unique device **serial number**.
 
-Resolve logic:
+**Why two strategies.** RealSense (and any well-behaved camera) has a unique
+serial, so it is identified by serial alone — fully **port-independent**, no
+re-pairing when you replug it. But cheap UVC webcams (e.g. the Innomaker U20CAM
+line) ship every unit with the same hardcoded ``iSerial = SN0001``, so
+``(vid, pid, serial)`` can't tell two of them apart. For those we fall back to a
+**compound key** ``(vid, pid, serial, usb_path)`` — the ``usb_path`` is the
+physical USB topology (which hub/port), which survives reboots but breaks when a
+cable moves; we recover with a user-supplied picker when it goes stale.
+
+UVC resolve logic (``kind == "opencv"``):
 
   1. Exact ``(vid, pid, serial, usb_path)`` match → return capture node.
   2. ``(vid, pid, serial)`` matches exactly one camera at a different usb_path
@@ -35,9 +40,15 @@ Resolve logic:
      choice as the new usb_path.
   4. No match → raise ``CameraNotConnectedError``.
 
+RealSense resolve logic (``kind == "intelrealsense"``): a connected RealSense
+with the registered serial → return that serial (ignores which port it's in);
+otherwise raise ``CameraNotConnectedError``.
+
 UVC cameras commonly create multiple ``/dev/video*`` nodes (capture, metadata,
 maybe more). Discovery groups them by their shared USB topology path and
 detects the capture-capable node via the V4L2 ``VIDIOC_QUERYCAP`` ioctl.
+RealSense is discovered separately through the pyrealsense2 SDK (optional
+dependency; absence degrades gracefully to "no RealSense found").
 """
 
 from __future__ import annotations
@@ -55,6 +66,15 @@ from pathlib import Path
 from lerobot.utils.constants import HF_LEROBOT_CALIBRATION
 
 CAMERAS_REGISTRY_FILENAME = "cameras.json"
+
+# Camera backends a registry entry can target.
+KIND_OPENCV = "opencv"
+KIND_REALSENSE = "intelrealsense"
+
+# Intel's USB vendor id. RealSense devices also enumerate as UVC nodes under this
+# vid (with an empty serial), so we drop those from UVC discovery when the SDK has
+# already surfaced the RealSense as its own (serial-bearing) entry.
+INTEL_VID = "8086"
 
 # V4L2 ioctl: _IOR('V', 0, sizeof(struct v4l2_capability)).
 # sizeof = 16(driver) + 32(card) + 32(bus_info) + 4(version)
@@ -91,6 +111,9 @@ class RegisteredCamera:
     usb_path: str
     model: str
     registered_at: str  # ISO-8601 UTC
+    # Backend this entry targets ("opencv" | "intelrealsense"). Defaults to
+    # "opencv" so pre-``kind`` registry files keep loading unchanged.
+    kind: str = KIND_OPENCV
 
 
 @dataclass
@@ -110,6 +133,9 @@ class DiscoveredCamera:
     model: str
     all_nodes: list[str] = field(default_factory=list)
     capture_node: str | None = None
+    # "opencv" for UVC/V4L2 cameras, "intelrealsense" for RealSense (no V4L2
+    # capture node; identified by its unique serial).
+    kind: str = KIND_OPENCV
 
 
 def _list_video_nodes() -> list[str]:
@@ -193,6 +219,58 @@ def discover_uvc_cameras() -> list[DiscoveredCamera]:
     return cameras
 
 
+def discover_realsense_cameras() -> list[DiscoveredCamera]:
+    """Find every Intel RealSense currently plugged in, via the pyrealsense2 SDK.
+
+    Each RealSense reports a globally-unique serial number, so it's identified by
+    serial alone (port-independent; ``capture_node`` is ``None`` — RealSense is
+    driven through the SDK, not V4L2). Returns ``[]`` if pyrealsense2 isn't
+    installed or no device is present — never raises.
+    """
+    from lerobot.utils.import_utils import _pyrealsense2_available
+
+    if not _pyrealsense2_available:
+        return []
+    try:
+        from lerobot.cameras.realsense.camera_realsense import RealSenseCamera
+
+        infos = RealSenseCamera.find_cameras()
+    except Exception:
+        # No device, SDK/driver hiccup, etc. — treat as "no RealSense found".
+        return []
+
+    cameras: list[DiscoveredCamera] = []
+    for info in infos:
+        cameras.append(
+            DiscoveredCamera(
+                usb_path=str(info.get("physical_port", "")),
+                vid=INTEL_VID,
+                pid=str(info.get("product_id", "")),
+                serial=str(info.get("id", "")),
+                model=str(info.get("name", "Intel RealSense")),
+                all_nodes=[],
+                capture_node=None,
+                kind=KIND_REALSENSE,
+            )
+        )
+    cameras.sort(key=lambda c: c.serial)
+    return cameras
+
+
+def discover_cameras() -> list[DiscoveredCamera]:
+    """Discover all supported cameras: UVC/V4L2 webcams plus Intel RealSense.
+
+    When RealSense devices are present, their stray Intel-vid UVC nodes (which
+    carry no usable serial) are dropped so each RealSense appears once — as its
+    serial-bearing ``intelrealsense`` entry.
+    """
+    uvc = discover_uvc_cameras()
+    realsense = discover_realsense_cameras()
+    if realsense:
+        uvc = [c for c in uvc if c.vid != INTEL_VID]
+    return uvc + realsense
+
+
 # A picker is a callable invoked when ``resolve()`` can't disambiguate from
 # identifiers alone. It receives the friendly name being resolved and the
 # list of candidate cameras, and must return the chosen one (or ``None`` if
@@ -243,21 +321,30 @@ class CameraRegistry:
     def find_by_name(self, name: str) -> RegisteredCamera | None:
         return next((c for c in self._cameras if c.name == name), None)
 
-    def register(self, camera: DiscoveredCamera, name: str) -> RegisteredCamera:
+    def register(self, camera: DiscoveredCamera, name: str, *, replace: bool = False) -> RegisteredCamera:
         """Bind a friendly name to a discovered camera.
 
         - If ``name`` is already mapped to a different ``(vid, pid, serial,
-          usb_path)`` quadruple → raise ``CameraNameConflictError`` so the
-          caller can prompt to re-pair.
+          usb_path)`` quadruple:
+          - ``replace=False`` (default): raise ``CameraNameConflictError`` so the
+            caller can prompt to re-pair.
+          - ``replace=True``: re-pair — drop the stale ``name`` → old-camera binding
+            and bind ``name`` to this camera instead. Use only once the user has
+            confirmed the re-pair.
         - Otherwise add or update the entry.
         """
         existing = self.find_by_name(name)
         if existing is not None and not _matches(existing, camera):
-            raise CameraNameConflictError(
-                f"Name {name!r} is already mapped to a different camera "
-                f"({existing.model} at {existing.usb_path}). "
-                "Unregister that entry first, or choose a different name."
-            )
+            if not replace:
+                raise CameraNameConflictError(
+                    f"Name {name!r} is already mapped to a different camera "
+                    f"({existing.model} at {existing.usb_path}). "
+                    "Unregister that entry first, or choose a different name."
+                )
+            # Re-pair: the name is moving to a new physical camera. Drop the stale
+            # binding so we don't end up with two entries sharing the same name.
+            self._cameras.remove(existing)
+            existing = None
         entry = RegisteredCamera(
             name=name,
             vid=camera.vid,
@@ -266,14 +353,20 @@ class CameraRegistry:
             usb_path=camera.usb_path,
             model=camera.model,
             registered_at=_now_iso(),
+            kind=camera.kind,
         )
         if existing is not None:
             existing.usb_path = entry.usb_path
             existing.registered_at = entry.registered_at
             existing.model = entry.model
+            existing.kind = entry.kind
             return existing
         self._cameras.append(entry)
         return entry
+
+    def find_by_camera(self, camera: DiscoveredCamera) -> RegisteredCamera | None:
+        """Return the entry already bound to this physical camera, if any."""
+        return next((c for c in self._cameras if _matches(c, camera)), None)
 
     def unregister(self, name: str) -> bool:
         """Remove a camera by name. Returns True if removed, False if not found."""
@@ -282,11 +375,14 @@ class CameraRegistry:
         return len(self._cameras) < before
 
     def resolve(self, name: str, picker: PickerFn | None = None) -> str:
-        """Resolve a friendly name to a ``/dev/video*`` capture node.
+        """Resolve a friendly name to the identifier its backend needs.
 
-        See module docstring for the four-case resolution logic. Returns the
-        capture node path on success; updates ``usb_path`` in the registry
-        (and persists the change) if the camera has moved.
+        - ``kind == "opencv"``: returns a ``/dev/video*`` capture node (and may
+          self-heal/persist a moved ``usb_path``); see module docstring.
+        - ``kind == "intelrealsense"``: returns the device **serial number**
+          (port-independent), to be passed as ``serial_number_or_name``.
+
+        Raises ``CameraNotConnectedError`` if the camera isn't currently present.
         """
         entry = self.find_by_name(name)
         if entry is None:
@@ -294,6 +390,9 @@ class CameraRegistry:
                 f"No camera named {name!r} is registered. "
                 "Run `lerobot-register-camera` first, or set --robot.cameras=... index_or_path manually."
             )
+
+        if entry.kind == KIND_REALSENSE:
+            return self._resolve_realsense(entry)
 
         connected = discover_uvc_cameras()
 
@@ -318,10 +417,13 @@ class CameraRegistry:
 
         if len(candidates) > 1:
             if picker is None:
+                ports = ", ".join(sorted(c.usb_path for c in candidates))
                 raise CameraNotConnectedError(
-                    f"Camera {name!r} (serial {entry.serial!r}) has multiple matching "
-                    f"candidates at different USB ports and no picker was provided. "
-                    "Re-run with a picker callback, or unplug all but one matching camera."
+                    f"Camera {name!r} (serial {entry.serial!r}) is not at its registered USB "
+                    f"port, and {len(candidates)} cameras share that serial, so it can't be "
+                    f"resolved unambiguously. Candidate ports: {ports}. "
+                    f"Plug {name!r} back into its registered port, or re-pair it with "
+                    f"`lerobot-register-camera --name {name}` (which lets you pick it from a preview)."
                 )
             chosen = picker(name, candidates)
             if chosen is None:
@@ -337,8 +439,24 @@ class CameraRegistry:
             f"registered but not currently connected. Plug it in and try again."
         )
 
+    def _resolve_realsense(self, entry: RegisteredCamera) -> str:
+        """Resolve a RealSense entry to its serial — independent of which port it's in."""
+        for cam in discover_realsense_cameras():
+            if cam.serial == entry.serial:
+                return entry.serial
+        raise CameraNotConnectedError(
+            f"RealSense camera {entry.name!r} (serial {entry.serial!r}) is registered but not "
+            "currently connected. Plug it into any USB port and try again. "
+            "(If pyrealsense2 isn't installed, install `lerobot[intelrealsense]`.)"
+        )
+
 
 def _matches(entry: RegisteredCamera, cam: DiscoveredCamera) -> bool:
+    if entry.kind != cam.kind:
+        return False
+    if entry.kind == KIND_REALSENSE:
+        # RealSense serials are globally unique — port-independent identity.
+        return cam.serial == entry.serial
     return (
         cam.vid == entry.vid
         and cam.pid == entry.pid

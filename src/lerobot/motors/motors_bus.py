@@ -555,7 +555,15 @@ class SerialMotorsBus(MotorsBusBase):
         if disable_torque:
             self.port_handler.clearPort()
             self.port_handler.is_using = False
-            self.disable_torque(num_retry=5)
+            try:
+                self.disable_torque(num_retry=5)
+            except Exception as e:
+                # A motor reporting e.g. an Overload fault at shutdown must not abort
+                # cleanup — closing the port is more important than the torque write.
+                logger.warning(
+                    f"{self.__class__.__name__}: failed to disable torque on disconnect ({e}). "
+                    "Closing the port anyway."
+                )
 
         self.port_handler.closePort()
         logger.debug(f"{self.__class__.__name__} disconnected.")

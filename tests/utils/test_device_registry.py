@@ -93,6 +93,35 @@ def test_register_raises_on_name_conflict(registry: DeviceRegistry):
         registry.register(serial="BBB222", name="leader", robot_type="so101_leader")
 
 
+def test_register_replace_repairs_name_to_new_serial(registry: DeviceRegistry):
+    # Re-pair: 'follower' moves from its old board to a freshly plugged one.
+    registry.register(serial="OLD111", name="follower", robot_type="so101_follower")
+    updated = registry.register(serial="NEW222", name="follower", robot_type="so101_follower", replace=True)
+    assert len(registry) == 1  # no duplicate name left behind
+    assert updated.serial == "NEW222"
+    assert registry.find_by_name("follower").serial == "NEW222"
+    assert registry.find_by_serial("OLD111") is None
+
+
+def test_register_replace_merges_when_new_serial_already_registered(registry: DeviceRegistry):
+    # The new board is itself already registered under another name. Re-pairing
+    # 'follower' onto it must leave a single, consistent entry.
+    registry.register(serial="OLD111", name="follower", robot_type="so101_follower")
+    registry.register(serial="NEW222", name="spare", robot_type="so101_follower")
+    registry.register(serial="NEW222", name="follower", robot_type="so101_follower", replace=True)
+    assert len(registry) == 1
+    assert registry.find_by_name("follower").serial == "NEW222"
+    assert registry.find_by_name("spare") is None
+    assert registry.find_by_serial("OLD111") is None
+
+
+def test_register_replace_without_conflict_is_plain_add(registry: DeviceRegistry):
+    # replace=True on a fresh name behaves like a normal registration.
+    device = registry.register(serial="AAA111", name="leader", robot_type="so101_leader", replace=True)
+    assert len(registry) == 1
+    assert device.name == "leader"
+
+
 def test_unregister_removes_by_name(registry: DeviceRegistry):
     registry.register(serial="AAA111", name="leader", robot_type="so101_leader")
     assert registry.unregister("leader") is True
@@ -231,3 +260,55 @@ def test_resolve_or_verify_port_explicit_port_mismatch_raises(isolated_registry_
         resolve_or_verify_port("leader", "/dev/ttyACM1")
     assert exc_info.value.expected_serial == "AAA111"
     assert exc_info.value.found_serial == "BBB222"
+
+
+def test_resolve_or_verify_port_cross_check_unregistered_name_using_others_port(
+    isolated_registry_path, two_so101_boards
+):
+    """Unregistered name + port that belongs to a different registered board → catch the swap."""
+    from lerobot.utils.device_registry import BoardClaimedByAnotherNameError
+
+    reg = DeviceRegistry(path=isolated_registry_path)
+    reg.register(serial="AAA111", name="leader", robot_type="so101_leader")
+    reg.save()
+    # 'follower' is NOT registered, but the user is pointing it at the leader's port.
+    # Pre-fix this would silently pass; the cross-check should refuse.
+    with pytest.raises(BoardClaimedByAnotherNameError) as exc_info:
+        resolve_or_verify_port("follower", "/dev/ttyACM0")
+    assert exc_info.value.owner_name == "leader"
+    assert exc_info.value.board_serial == "AAA111"
+    assert exc_info.value.requested_name == "follower"
+
+
+def test_resolve_or_verify_port_cross_check_no_id_using_registered_port(
+    isolated_registry_path, two_so101_boards
+):
+    """User omits --robot.id but supplies a port that belongs to a registered board → catch the swap."""
+    from lerobot.utils.device_registry import BoardClaimedByAnotherNameError
+
+    reg = DeviceRegistry(path=isolated_registry_path)
+    reg.register(serial="AAA111", name="leader", robot_type="so101_leader")
+    reg.save()
+    with pytest.raises(BoardClaimedByAnotherNameError) as exc_info:
+        resolve_or_verify_port(None, "/dev/ttyACM0")
+    assert exc_info.value.owner_name == "leader"
+    assert exc_info.value.requested_name is None
+
+
+def test_resolve_or_verify_port_cross_check_legacy_passthrough_preserved(
+    isolated_registry_path, two_so101_boards
+):
+    """When neither the name nor the connected board is in the registry, port still passes through."""
+    # No registrations at all → fully legacy behavior preserved.
+    assert resolve_or_verify_port("follower", "/dev/ttyACM0") == "/dev/ttyACM0"
+    assert resolve_or_verify_port(None, "/dev/ttyACM0") == "/dev/ttyACM0"
+
+
+def test_resolve_or_verify_port_no_port_no_id_gives_clear_error(isolated_registry_path):
+    """When the user passes neither --robot.id nor --robot.port, error message should not mention `None`."""
+    with pytest.raises(ValueError) as exc_info:
+        resolve_or_verify_port(None, None, register_command_hint="--type so101_leader")
+    msg = str(exc_info.value)
+    assert "None" not in msg.split("`")[0]  # not in the prose part
+    assert "--robot.port" in msg
+    assert "<friendly_name>" in msg

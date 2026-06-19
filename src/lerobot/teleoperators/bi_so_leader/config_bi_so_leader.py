@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from ..config import TeleoperatorConfig
 from ..so_leader import SOLeaderConfig
@@ -23,7 +23,13 @@ from ..so_leader import SOLeaderConfig
 @TeleoperatorConfig.register_subclass("bi_so_leader")
 @dataclass
 class BiSOLeaderConfig(TeleoperatorConfig):
-    """Configuration class for Bi SO Leader teleoperators."""
+    """Configuration class for Bi SO Leader teleoperators.
 
-    left_arm_config: SOLeaderConfig
-    right_arm_config: SOLeaderConfig
+    The two arm configs default to empty ``SOLeaderConfig``s so a bimanual leader
+    can be driven by ``--teleop.id=<id>`` alone (each arm's port is then resolved
+    from the device registry via ``{id}_left`` / ``{id}_right``). Pass explicit
+    ``--teleop.<side>_arm_config.port=...`` to override.
+    """
+
+    left_arm_config: SOLeaderConfig = field(default_factory=SOLeaderConfig)
+    right_arm_config: SOLeaderConfig = field(default_factory=SOLeaderConfig)

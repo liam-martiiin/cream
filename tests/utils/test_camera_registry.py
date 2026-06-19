@@ -18,13 +18,32 @@ from pathlib import Path
 import pytest
 
 from lerobot.utils.camera_registry import (
+    KIND_OPENCV,
+    KIND_REALSENSE,
     CameraNameConflictError,
     CameraNotConnectedError,
     CameraRegistry,
     DiscoveredCamera,
     NoCaptureNodeError,
+    discover_cameras,
+    discover_realsense_cameras,
     discover_uvc_cameras,
 )
+
+
+def _rs_cam(serial: str = "RS123", usb_path: str = "2-1", model: str = "Intel RealSense D435"):
+    """A discovered RealSense (no capture node; identified by unique serial)."""
+    return DiscoveredCamera(
+        usb_path=usb_path,
+        vid="8086",
+        pid="0b07",
+        serial=serial,
+        model=model,
+        all_nodes=[],
+        capture_node=None,
+        kind=KIND_REALSENSE,
+    )
+
 
 # --- Fakes for the three monkeypatch seams ----------------------------------
 
@@ -173,6 +192,35 @@ def test_register_raises_on_name_conflict(registry: CameraRegistry):
     registry.register(cam_a, "right_overhead")
     with pytest.raises(CameraNameConflictError, match="right_overhead"):
         registry.register(cam_b, "right_overhead")
+
+
+def test_register_replace_repairs_name_to_new_camera(registry: CameraRegistry):
+    """replace=True re-pairs a name onto a new camera, dropping the stale binding —
+    no manual unregister required (the re-pair flow used by lerobot-register-camera)."""
+    stale = DiscoveredCamera(
+        usb_path="usb-0:3.3:1.0",  # old port, camera since moved/unplugged
+        vid="0c45",
+        pid="6366",
+        serial="SN0001",
+        model="U20CAM",
+        capture_node="/dev/video0",
+    )
+    moved = DiscoveredCamera(
+        usb_path="usb-0:4.3:1.0",  # where the camera actually is now
+        vid="0c45",
+        pid="6366",
+        serial="SN0001",
+        model="U20CAM",
+        capture_node="/dev/video2",
+    )
+    registry.register(stale, "left_arm")
+
+    # Without replace this raises (covered above); with replace it just re-pairs.
+    entry = registry.register(moved, "left_arm", replace=True)
+
+    assert entry.usb_path == "usb-0:4.3:1.0"
+    assert len(registry) == 1  # no duplicate "left_arm" left behind
+    assert registry.find_by_name("left_arm").usb_path == "usb-0:4.3:1.0"
 
 
 def test_register_same_name_same_camera_updates_in_place(registry: CameraRegistry):
@@ -363,19 +411,28 @@ def test_resolve_picker_cancelled_raises(registry: CameraRegistry, two_u20cams):
 
 
 def test_resolve_ambiguous_without_picker_raises(registry: CameraRegistry, two_u20cams):
+    """Without a picker, an unresolvable (same-serial) name must raise an actionable
+    error — listing candidate ports and the re-pair command — rather than prompting."""
     registry.register(
         DiscoveredCamera(
-            usb_path="usb-0:9:1.0",
+            usb_path="usb-0:9:1.0",  # not currently connected
             vid="0c45",
             pid="6366",
-            serial="SN0001",
+            serial="SN0001",  # shared with the two connected U20CAMs
             model="U20CAM",
             capture_node="/dev/video0",
         ),
         "right_overhead",
     )
-    with pytest.raises(CameraNotConnectedError, match="picker"):
+    with pytest.raises(CameraNotConnectedError) as exc_info:
         registry.resolve("right_overhead", picker=None)
+
+    msg = str(exc_info.value)
+    assert "right_overhead" in msg
+    # Candidate ports listed so the user can see where its same-serial siblings are.
+    assert "usb-0:3:1.0" in msg and "usb-0:4:1.0" in msg
+    # Actionable remedy instead of a developer-facing "provide a picker callback".
+    assert "lerobot-register-camera --name right_overhead" in msg
 
 
 def test_resolve_no_match_at_all_raises(registry: CameraRegistry, fake_discovery):
@@ -415,3 +472,122 @@ def test_resolve_raises_when_matched_camera_has_no_capture_node(registry: Camera
     )
     with pytest.raises(NoCaptureNodeError):
         registry.resolve("right_overhead")
+
+
+# --- kind / RealSense support -----------------------------------------------
+
+
+def test_load_defaults_kind_to_opencv(tmp_path: Path):
+    """Pre-`kind` registry files keep loading; entries default to opencv."""
+    path = tmp_path / "cameras.json"
+    path.write_text(
+        json.dumps(
+            {
+                "cameras": [
+                    {
+                        "name": "a",
+                        "vid": "0c45",
+                        "pid": "6366",
+                        "serial": "SN0001",
+                        "usb_path": "u",
+                        "model": "m",
+                        "registered_at": "t",
+                    }
+                ]
+            }
+        )
+    )
+    reg = CameraRegistry.load(path=path)
+    assert reg.find_by_name("a").kind == KIND_OPENCV
+
+
+def test_discover_realsense_absent_returns_empty(monkeypatch):
+    monkeypatch.setattr("lerobot.utils.import_utils._pyrealsense2_available", False)
+    assert discover_realsense_cameras() == []
+
+
+def test_discover_realsense_maps_sdk_info(monkeypatch):
+    # Import the module while pyrealsense2 is really absent, so its import-time guard
+    # binds rs=None safely; only THEN pretend the SDK is available and stub find_cameras.
+    import lerobot.cameras.realsense.camera_realsense as crs
+
+    monkeypatch.setattr("lerobot.utils.import_utils._pyrealsense2_available", True)
+    monkeypatch.setattr(
+        crs.RealSenseCamera,
+        "find_cameras",
+        staticmethod(
+            lambda: [
+                {"id": "RS999", "name": "Intel RealSense D435", "physical_port": "2-1", "product_id": "0B07"}
+            ]
+        ),
+    )
+    cams = discover_realsense_cameras()
+    assert len(cams) == 1
+    assert cams[0].kind == KIND_REALSENSE
+    assert cams[0].serial == "RS999"
+    assert cams[0].capture_node is None
+
+
+def test_discover_cameras_dedups_intel_uvc_when_realsense_present(monkeypatch):
+    """A RealSense's stray Intel-vid UVC node is dropped; it appears once as RS."""
+    uvc = [
+        DiscoveredCamera(
+            usb_path="u1", vid="0c45", pid="6366", serial="SN0001", model="webcam", capture_node="/dev/video0"
+        ),
+        DiscoveredCamera(
+            usb_path="u2",
+            vid="8086",
+            pid="0b07",
+            serial="",
+            model="Intel UVC node",
+            capture_node="/dev/video4",
+        ),
+    ]
+    monkeypatch.setattr("lerobot.utils.camera_registry.discover_uvc_cameras", lambda: uvc)
+    monkeypatch.setattr("lerobot.utils.camera_registry.discover_realsense_cameras", lambda: [_rs_cam()])
+    out = discover_cameras()
+    assert not any(c.vid == "8086" and c.kind == KIND_OPENCV for c in out)  # Intel UVC node dropped
+    assert any(c.kind == KIND_REALSENSE for c in out)  # RealSense present
+    assert any(c.serial == "SN0001" for c in out)  # non-Intel webcam kept
+
+
+def test_register_realsense_by_serial(registry: CameraRegistry):
+    entry = registry.register(_rs_cam(serial="RS123"), "depth_cam")
+    assert entry.kind == KIND_REALSENSE
+    assert entry.serial == "RS123"
+
+
+def test_register_realsense_repair_at_new_port_updates_in_place(registry: CameraRegistry):
+    registry.register(_rs_cam(serial="RS123", usb_path="2-1"), "depth_cam")
+    # Same serial, different port → same physical camera, updated in place (no conflict).
+    registry.register(_rs_cam(serial="RS123", usb_path="9-9"), "depth_cam")
+    assert len(registry) == 1
+    assert registry.find_by_name("depth_cam").usb_path == "9-9"
+
+
+def test_resolve_realsense_is_port_independent(registry: CameraRegistry, monkeypatch):
+    registry.register(_rs_cam(serial="RS123", usb_path="2-1"), "depth_cam")
+    # Connected at a DIFFERENT port → still resolves to its serial, no re-pair.
+    monkeypatch.setattr(
+        "lerobot.utils.camera_registry.discover_realsense_cameras",
+        lambda: [_rs_cam(serial="RS123", usb_path="9-9")],
+    )
+    assert registry.resolve("depth_cam") == "RS123"
+
+
+def test_resolve_realsense_not_connected_raises(registry: CameraRegistry, monkeypatch):
+    registry.register(_rs_cam(serial="RS123"), "depth_cam")
+    monkeypatch.setattr("lerobot.utils.camera_registry.discover_realsense_cameras", lambda: [])
+    with pytest.raises(CameraNotConnectedError, match="RealSense"):
+        registry.resolve("depth_cam")
+
+
+def test_find_by_camera_is_kind_aware(registry: CameraRegistry):
+    registry.register(_rs_cam(serial="RS1"), "rs")
+    # A UVC camera that happens to share the serial string must NOT match the RS entry.
+    uvc = DiscoveredCamera(
+        usb_path="u", vid="v", pid="p", serial="RS1", model="m", capture_node="/dev/video0"
+    )
+    assert registry.find_by_camera(uvc) is None
+    # The RealSense matches by serial regardless of port.
+    assert registry.find_by_camera(_rs_cam(serial="RS1", usb_path="other")) is not None

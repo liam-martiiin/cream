@@ -61,6 +61,16 @@ def test_abc_implementation():
     _ = RealSenseCamera(config)
 
 
+def test_id_resolves_serial_via_registry():
+    """A config with `id` resolves to a serial through the camera registry (port-independent)."""
+    config = RealSenseCameraConfig(id="depth_cam")
+    with patch("lerobot.utils.camera_registry.CameraRegistry.load") as mock_load:
+        mock_load.return_value.resolve.return_value = "042"
+        camera = RealSenseCamera(config)
+    mock_load.return_value.resolve.assert_called_once_with("depth_cam")
+    assert camera.serial_number == "042"
+
+
 def test_connect():
     config = RealSenseCameraConfig(serial_number_or_name="042", warmup_s=0)
 

@@ -72,6 +72,32 @@ class DeviceMismatchError(DeviceRegistryError):
         )
 
 
+class BoardClaimedByAnotherNameError(DeviceRegistryError):
+    """Raised when a user-supplied port points at a board registered under a different name."""
+
+    def __init__(
+        self,
+        port: str,
+        board_serial: str,
+        owner_name: str,
+        owner_robot_type: str,
+        requested_name: str | None,
+    ):
+        self.port = port
+        self.board_serial = board_serial
+        self.owner_name = owner_name
+        self.owner_robot_type = owner_robot_type
+        self.requested_name = requested_name
+        requested = f"id={requested_name!r}" if requested_name else "no --robot.id"
+        super().__init__(
+            f"The board at {port} (serial {board_serial!r}) is registered as "
+            f"{owner_name!r} ({owner_robot_type}), but you requested {requested}. "
+            f"Did you swap USB cables, or do you mean --robot.id={owner_name}? "
+            "If this is a genuinely different device, unregister the conflicting "
+            "entry first."
+        )
+
+
 @dataclass
 class RegisteredDevice:
     """A single entry in the device registry."""
@@ -171,19 +197,30 @@ class DeviceRegistry:
     def find_by_serial(self, serial: str) -> RegisteredDevice | None:
         return next((d for d in self._devices if d.serial == serial), None)
 
-    def register(self, serial: str, name: str, robot_type: str) -> RegisteredDevice:
+    def register(self, serial: str, name: str, robot_type: str, *, replace: bool = False) -> RegisteredDevice:
         """Add or update a device entry.
 
-        - If ``serial`` already exists: update name and robot_type in place.
-        - If ``name`` already exists for a different serial: raise
-          ``DeviceNameConflictError`` so the caller can prompt the user.
+        - If ``serial`` already exists: update its name and robot_type in place.
+        - If ``name`` already exists for a *different* serial:
+          - ``replace=False`` (default): raise ``DeviceNameConflictError`` so the
+            caller can prompt the user before clobbering an existing binding.
+          - ``replace=True``: re-pair — drop the stale ``name`` → old-serial binding
+            and bind ``name`` to ``serial`` instead. Use only once the user has
+            explicitly confirmed the re-pair.
+
+        The registry invariant (each name and each serial appear at most once) is
+        preserved in every case.
         """
         existing_by_name = self.find_by_name(name)
         if existing_by_name is not None and existing_by_name.serial != serial:
-            raise DeviceNameConflictError(
-                f"Name {name!r} is already mapped to serial {existing_by_name.serial!r}. "
-                "Unregister that entry first, or choose a different name."
-            )
+            if not replace:
+                raise DeviceNameConflictError(
+                    f"Name {name!r} is already mapped to serial {existing_by_name.serial!r}. "
+                    "Unregister that entry first, or choose a different name."
+                )
+            # Re-pair: the name is moving to a new board. Drop the old binding so we
+            # don't end up with two entries sharing the same name.
+            self._devices.remove(existing_by_name)
         existing_by_serial = self.find_by_serial(serial)
         if existing_by_serial is not None:
             existing_by_serial.name = name
@@ -226,11 +263,13 @@ class DeviceRegistry:
         )
 
 
-def resolve_or_verify_port(name: str, port: str | None, register_command_hint: str | None = None) -> str:
+def resolve_or_verify_port(
+    name: str | None, port: str | None, register_command_hint: str | None = None
+) -> str:
     """Resolve a robot's port from the registry, or verify a user-supplied one.
 
     Intended to be called from robot/teleoperator ``__init__`` to abstract over
-    the four legitimate states:
+    the legitimate states:
 
     +----------------+----------------------+-----------------------------------+
     | port           | name registered?     | result                            |
@@ -240,21 +279,37 @@ def resolve_or_verify_port(name: str, port: str | None, register_command_hint: s
     | ``None``       | no                   | raise: user must register or pass |
     |                |                      | ``--robot.port``                  |
     +----------------+----------------------+-----------------------------------+
-    | given          | yes                  | verify the connected board's      |
-    |                |                      | serial matches; raise on mismatch |
+    | given          | yes                  | verify connected board's serial   |
+    |                |                      | matches; raise on mismatch        |
     +----------------+----------------------+-----------------------------------+
-    | given          | no                   | return port unchanged (legacy)    |
+    | given          | no                   | cross-check: if the board at      |
+    |                |                      | ``port`` is registered under a    |
+    |                |                      | DIFFERENT name, raise so cable    |
+    |                |                      | swaps are caught even when the    |
+    |                |                      | requested id is unregistered or   |
+    |                |                      | absent. Otherwise return port.    |
     +----------------+----------------------+-----------------------------------+
+
+    The cross-check makes the safety guarantee symmetric: it doesn't matter
+    whether the user supplied an id or a raw port — if ANY registered name
+    owns the connected board, we catch the mismatch.
 
     ``register_command_hint`` is woven into error messages so the suggested
     ``lerobot-register-device`` invocation includes the right ``--type``.
     """
     registry = DeviceRegistry.load()
-    registered = registry.find_by_name(name)
+    registered = registry.find_by_name(name) if name is not None else None
 
     if port is None:
         if registered is None:
             hint = f" {register_command_hint}" if register_command_hint else ""
+            if name is None:
+                raise ValueError(
+                    "No port specified and no robot id provided. Either pass "
+                    "--robot.port=<path>, or register a device with "
+                    f"`lerobot-register-device{hint} --name <friendly_name>` "
+                    "and then use --robot.id=<friendly_name>."
+                )
             raise ValueError(
                 f"No port specified for id={name!r}, and no device named {name!r} is "
                 f"registered. Either pass --robot.port, or run "
@@ -262,10 +317,28 @@ def resolve_or_verify_port(name: str, port: str | None, register_command_hint: s
             )
         return registry.resolve_port(name)
 
+    # Port is supplied. Look up what's actually plugged in once and use the
+    # result for both the "id is registered" and "cross-check" branches.
+    connected_serial = serial_for_port(port)
+
     if registered is not None:
-        connected_serial = serial_for_port(port)
         if connected_serial is not None and connected_serial != registered.serial:
             raise DeviceMismatchError(name, registered.serial, connected_serial)
+        return port
+
+    # name is unregistered (or absent) but a port was supplied. Cross-check:
+    # if the board at that port is registered under SOME OTHER name, this is
+    # almost certainly a cable swap. Raise rather than silently bypass.
+    if connected_serial is not None:
+        owner = registry.find_by_serial(connected_serial)
+        if owner is not None:
+            raise BoardClaimedByAnotherNameError(
+                port=port,
+                board_serial=connected_serial,
+                owner_name=owner.name,
+                owner_robot_type=owner.robot_type,
+                requested_name=name,
+            )
     return port
 
 

@@ -18,6 +18,7 @@ from lerobot.utils.camera_picker import (
     _grid_shape,
     _GuiUnavailableError,
     _should_use_text_mode,
+    assign_names,
     pick_camera,
 )
 from lerobot.utils.camera_registry import DiscoveredCamera
@@ -169,3 +170,26 @@ def test_grid_shape_layouts():
     assert _grid_shape(6) == (3, 2)
     assert _grid_shape(7) == (3, 3)
     assert _grid_shape(9) == (3, 3)
+
+
+# --- Batch assign_names (force_text_mode skips the snapshot/Rerun display) ---
+
+
+def test_assign_names_collects_named_cameras(force_text_mode, fake_input):
+    cams = [_cam(0), _cam(1), _cam(2)]
+    fake_input(["top_left", "", "right_arm"])  # middle camera skipped (blank)
+    result = assign_names(cams)
+    assert [(c.usb_path, n) for c, n in result] == [
+        (cams[0].usb_path, "top_left"),
+        (cams[2].usb_path, "right_arm"),
+    ]
+
+
+def test_assign_names_all_blank_returns_empty(force_text_mode, fake_input):
+    cams = [_cam(0), _cam(1)]
+    fake_input(["", ""])
+    assert assign_names(cams) == []
+
+
+def test_assign_names_no_cameras_returns_empty():
+    assert assign_names([]) == []

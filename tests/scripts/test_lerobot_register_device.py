@@ -163,6 +163,87 @@ def test_skips_calibration_when_file_exists(
     assert no_calibration_launch == []  # no subprocess invocation
 
 
+def test_repair_name_to_new_board_when_old_is_disconnected(
+    monkeypatch, isolated_registry, fake_input, no_calibration_launch
+):
+    """Regression: a name bound to a now-disconnected board, with only a new board plugged in.
+
+    Previously the re-pair flow asked for confirmation, accepted the new board, then
+    failed with DeviceNameConflictError because the name still pointed at the old serial.
+    """
+    monkeypatch.setattr(
+        "lerobot.utils.device_registry._comports",
+        lambda: [_fake_port("/dev/ttyACM2", "NEW333")],
+    )
+    reg = DeviceRegistry.load()
+    reg.register(serial="OLD999", name="follower", robot_type="so101_follower")
+    reg.save()
+
+    fake_input(["y", "1"])  # confirm re-pair, then pick the single connected board
+    rc = cmd.register_device("so101_follower", "follower", run_calibration=False)
+
+    assert rc == 0
+    reloaded = DeviceRegistry.load()
+    assert reloaded.find_by_name("follower").serial == "NEW333"
+    assert reloaded.find_by_serial("OLD999") is None
+    assert len(reloaded) == 1  # no stale duplicate left behind
+
+
+def test_repair_declined_leaves_registry_untouched(
+    monkeypatch, isolated_registry, fake_input, no_calibration_launch
+):
+    monkeypatch.setattr(
+        "lerobot.utils.device_registry._comports",
+        lambda: [_fake_port("/dev/ttyACM2", "NEW333")],
+    )
+    reg = DeviceRegistry.load()
+    reg.register(serial="OLD999", name="follower", robot_type="so101_follower")
+    reg.save()
+
+    fake_input(["n"])  # decline the re-pair prompt
+    rc = cmd.register_device("so101_follower", "follower", run_calibration=False)
+
+    assert rc == 1
+    assert DeviceRegistry.load().find_by_name("follower").serial == "OLD999"
+
+
+def test_unregister_removes_entry(isolated_registry, capsys):
+    reg = DeviceRegistry.load()
+    reg.register(serial="AAA111", name="leader", robot_type="so101_leader")
+    reg.save()
+
+    rc = cmd.unregister_device("leader")
+
+    assert rc == 0
+    assert DeviceRegistry.load().find_by_name("leader") is None
+    assert "Unregistered" in capsys.readouterr().out
+
+
+def test_unregister_missing_name_returns_1(isolated_registry, capsys):
+    rc = cmd.unregister_device("ghost")
+    assert rc == 1
+    assert "Nothing to do" in capsys.readouterr().err
+
+
+def test_main_unregister_dispatch(isolated_registry, monkeypatch):
+    reg = DeviceRegistry.load()
+    reg.register(serial="AAA111", name="leader", robot_type="so101_leader")
+    reg.save()
+    monkeypatch.setattr("sys.argv", ["lerobot-register-device", "--unregister", "--name", "leader"])
+    with pytest.raises(SystemExit) as exc_info:
+        cmd.main()
+    assert exc_info.value.code == 0
+    assert DeviceRegistry.load().find_by_name("leader") is None
+
+
+def test_main_register_requires_type(isolated_registry, monkeypatch, capsys):
+    monkeypatch.setattr("sys.argv", ["lerobot-register-device", "--name", "leader"])
+    with pytest.raises(SystemExit) as exc_info:
+        cmd.main()
+    assert exc_info.value.code != 0  # argparse parser.error exits 2
+    assert "--type is required" in capsys.readouterr().err
+
+
 def test_calibration_path_uses_class_dir_not_cli_type(tmp_path: Path, monkeypatch):
     monkeypatch.setattr("lerobot.scripts.lerobot_register_device.HF_LEROBOT_CALIBRATION", tmp_path)
     leader = cmd._calibration_path("so101_leader", "leader")

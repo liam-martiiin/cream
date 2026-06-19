@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from ..config import RobotConfig
 from ..so_follower import SOFollowerConfig
@@ -23,7 +23,13 @@ from ..so_follower import SOFollowerConfig
 @RobotConfig.register_subclass("bi_so_follower")
 @dataclass
 class BiSOFollowerConfig(RobotConfig):
-    """Configuration class for Bi SO Follower robots."""
+    """Configuration class for Bi SO Follower robots.
 
-    left_arm_config: SOFollowerConfig
-    right_arm_config: SOFollowerConfig
+    The two arm configs default to empty ``SOFollowerConfig``s so a bimanual
+    follower can be driven by ``--robot.id=<id>`` alone (each arm's port is then
+    resolved from the device registry via ``{id}_left`` / ``{id}_right``). Pass
+    explicit ``--robot.<side>_arm_config.port=...`` to override.
+    """
+
+    left_arm_config: SOFollowerConfig = field(default_factory=SOFollowerConfig)
+    right_arm_config: SOFollowerConfig = field(default_factory=SOFollowerConfig)

@@ -46,7 +46,7 @@ def two_cameras(monkeypatch):
         _cam("usb-0:3:1.0", "/dev/video2"),
         _cam("usb-0:4:1.0", "/dev/video0"),
     ]
-    monkeypatch.setattr("lerobot.scripts.lerobot_register_camera.discover_uvc_cameras", lambda: cams)
+    monkeypatch.setattr("lerobot.scripts.lerobot_register_camera.discover_cameras", lambda: cams)
     return cams
 
 
@@ -81,10 +81,10 @@ def fake_input(monkeypatch):
 
 
 def test_no_cameras_returns_failure(monkeypatch, isolated_registry, capsys):
-    monkeypatch.setattr("lerobot.scripts.lerobot_register_camera.discover_uvc_cameras", lambda: [])
+    monkeypatch.setattr("lerobot.scripts.lerobot_register_camera.discover_cameras", lambda: [])
     rc = cmd.register_camera("right_overhead")
     assert rc == 1
-    assert "No UVC cameras detected" in capsys.readouterr().err
+    assert "No cameras detected" in capsys.readouterr().err
 
 
 def test_successful_registration(isolated_registry, two_cameras, fake_picker, capsys):
@@ -107,7 +107,7 @@ def test_picker_cancelled_returns_failure(isolated_registry, two_cameras, fake_p
 
 def test_camera_with_no_capture_node_rejected(isolated_registry, monkeypatch, fake_picker, capsys):
     broken = _cam("usb-0:5:1.0", capture_node=None)
-    monkeypatch.setattr("lerobot.scripts.lerobot_register_camera.discover_uvc_cameras", lambda: [broken])
+    monkeypatch.setattr("lerobot.scripts.lerobot_register_camera.discover_cameras", lambda: [broken])
     fake_picker(broken)
     rc = cmd.register_camera("right_overhead")
     assert rc == 1
@@ -173,3 +173,114 @@ def test_registering_same_camera_with_same_name_is_idempotent(isolated_registry,
     assert rc == 0
     reg = CameraRegistry.load()
     assert len([c for c in reg if c.name == "right_overhead"]) == 1
+
+
+def _rs_cam(serial: str = "RS999") -> DiscoveredCamera:
+    """A discovered RealSense (no capture node; unique serial)."""
+    return DiscoveredCamera(
+        usb_path="2-1",
+        vid="8086",
+        pid="0b07",
+        serial=serial,
+        model="Intel RealSense D435",
+        all_nodes=[],
+        capture_node=None,
+        kind="intelrealsense",
+    )
+
+
+def test_register_realsense_by_serial(isolated_registry, monkeypatch, fake_picker, capsys):
+    """A RealSense (no capture node) registers fine and is keyed by serial, not port."""
+    rs = _rs_cam(serial="RS999")
+    monkeypatch.setattr("lerobot.scripts.lerobot_register_camera.discover_cameras", lambda: [rs])
+    fake_picker(rs)
+
+    rc = cmd.register_camera("top_depth")
+
+    assert rc == 0  # NOT rejected for lacking a V4L2 capture node
+    out = capsys.readouterr().out
+    assert "RealSense" in out
+    entry = CameraRegistry.load().find_by_name("top_depth")
+    assert entry.kind == "intelrealsense"
+    assert entry.serial == "RS999"
+
+
+# --- batch --all mode (assign_names mocked to bypass the snapshot/prompt UI) ---
+
+
+def test_register_all_registers_multiple_including_realsense(isolated_registry, monkeypatch, capsys):
+    webcam = _cam("usb-0:3:1.0", "/dev/video0")
+    rs = _rs_cam(serial="RS999")
+    monkeypatch.setattr("lerobot.scripts.lerobot_register_camera.discover_cameras", lambda: [webcam, rs])
+    monkeypatch.setattr(
+        "lerobot.scripts.lerobot_register_camera.assign_names",
+        lambda cams: [(webcam, "left_arm"), (rs, "top_depth")],
+    )
+
+    rc = cmd.register_all()
+
+    assert rc == 0
+    reg = CameraRegistry.load()
+    assert reg.find_by_name("left_arm").kind == "opencv"
+    rs_entry = reg.find_by_name("top_depth")
+    assert rs_entry.kind == "intelrealsense" and rs_entry.serial == "RS999"
+
+
+def test_register_all_rejects_duplicate_names(isolated_registry, monkeypatch, capsys):
+    c1 = _cam("usb-0:3:1.0", "/dev/video0")
+    c2 = _cam("usb-0:4:1.0", "/dev/video2")
+    monkeypatch.setattr("lerobot.scripts.lerobot_register_camera.discover_cameras", lambda: [c1, c2])
+    monkeypatch.setattr(
+        "lerobot.scripts.lerobot_register_camera.assign_names",
+        lambda cams: [(c1, "dup"), (c2, "dup")],
+    )
+
+    rc = cmd.register_all()
+
+    assert rc == 1
+    assert "Duplicate name" in capsys.readouterr().err
+    assert len(CameraRegistry.load()) == 0  # nothing saved
+
+
+def test_register_all_no_names_returns_failure(isolated_registry, monkeypatch, capsys):
+    c1 = _cam("usb-0:3:1.0", "/dev/video0")
+    monkeypatch.setattr("lerobot.scripts.lerobot_register_camera.discover_cameras", lambda: [c1])
+    monkeypatch.setattr("lerobot.scripts.lerobot_register_camera.assign_names", lambda cams: [])
+
+    rc = cmd.register_all()
+
+    assert rc == 1
+    assert "No names entered" in capsys.readouterr().err
+
+
+def test_register_all_repairs_camera_under_new_name(isolated_registry, monkeypatch):
+    c1 = _cam("usb-0:3:1.0", "/dev/video0")
+    reg = CameraRegistry.load()
+    reg.register(c1, "old_name")
+    reg.save()
+    monkeypatch.setattr("lerobot.scripts.lerobot_register_camera.discover_cameras", lambda: [c1])
+    monkeypatch.setattr(
+        "lerobot.scripts.lerobot_register_camera.assign_names", lambda cams: [(c1, "new_name")]
+    )
+
+    rc = cmd.register_all()
+
+    assert rc == 0
+    reg2 = CameraRegistry.load()
+    assert reg2.find_by_name("new_name") is not None
+    assert reg2.find_by_name("old_name") is None  # stale binding dropped
+    assert len(reg2) == 1
+
+
+def test_main_name_and_all_are_mutually_exclusive(isolated_registry, monkeypatch):
+    monkeypatch.setattr("sys.argv", ["lerobot-register-camera", "--name", "x", "--all"])
+    with pytest.raises(SystemExit) as exc_info:
+        cmd.main()
+    assert exc_info.value.code != 0  # argparse parser.error exits non-zero
+
+
+def test_main_requires_name_or_all(isolated_registry, monkeypatch):
+    monkeypatch.setattr("sys.argv", ["lerobot-register-camera"])
+    with pytest.raises(SystemExit) as exc_info:
+        cmd.main()
+    assert exc_info.value.code != 0

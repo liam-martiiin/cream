@@ -358,3 +358,27 @@ def test_sync_write_by_value_dict(data_name, ids_values, dummy_motors):
     mock__encode_sign.assert_called_once_with(data_name, ids_values)
     if data_name in bus.normalized_data:
         mock__unnormalize.assert_called_once_with(ids_values)
+
+
+def test_disconnect_survives_torque_disable_failure(dummy_motors):
+    """A motor faulting on disable_torque at shutdown (e.g. Overload) must not abort
+    the disconnect — the port still has to be closed."""
+    bus = MockMotorsBus("/dev/dummy-port", dummy_motors)
+    bus.port_handler.openPort()
+    assert bus.is_connected
+
+    with patch.object(MockMotorsBus, "disable_torque", side_effect=RuntimeError("Overload error!")):
+        bus.disconnect()  # must NOT raise despite disable_torque blowing up
+
+    assert not bus.is_connected  # closePort() still happened
+
+
+def test_disconnect_skips_torque_when_disabled(dummy_motors):
+    """With disable_torque=False, disconnect must not even attempt the torque write."""
+    bus = MockMotorsBus("/dev/dummy-port", dummy_motors)
+    bus.port_handler.openPort()
+
+    with patch.object(MockMotorsBus, "disable_torque", side_effect=AssertionError("should not be called")):
+        bus.disconnect(disable_torque=False)
+
+    assert not bus.is_connected

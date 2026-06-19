@@ -121,10 +121,20 @@ class RealSenseCamera(Camera):
 
         self.config = config
 
-        if config.serial_number_or_name.isdigit():
-            self.serial_number = config.serial_number_or_name
+        if config.id is not None:
+            # Resolve a friendly name from the camera registry to a concrete serial.
+            # RealSense serials are unique, so this is port-independent (no re-pairing
+            # on replug). Imported lazily so non-registry users don't pay the cost.
+            from lerobot.utils.camera_registry import CameraRegistry
+
+            serial_number_or_name = CameraRegistry.load().resolve(config.id)
         else:
-            self.serial_number = self._find_serial_number_from_name(config.serial_number_or_name)
+            serial_number_or_name = config.serial_number_or_name
+
+        if serial_number_or_name.isdigit():
+            self.serial_number = serial_number_or_name
+        else:
+            self.serial_number = self._find_serial_number_from_name(serial_number_or_name)
 
         self.fps = config.fps
         self.color_mode = config.color_mode

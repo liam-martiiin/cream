@@ -41,27 +41,42 @@ class RealSenseCameraConfig(CameraConfig):
         width: Requested frame width in pixels for the color stream.
         height: Requested frame height in pixels for the color stream.
         serial_number_or_name: Unique serial number or human-readable name to identify the camera.
+                      Mutually exclusive with ``id``.
+        id: Friendly name from the camera registry (set up via ``lerobot-register-camera``).
+                      Mutually exclusive with ``serial_number_or_name``. When set, the camera's
+                      serial is resolved at construction time via :pyclass:`CameraRegistry`, so it
+                      is identified by serial regardless of which USB port it's plugged into.
         color_mode: Color mode for image output (RGB or BGR). Defaults to RGB.
         use_depth: Whether to enable depth stream. Defaults to False.
         rotation: Image rotation setting (0°, 90°, 180°, or 270°). Defaults to no rotation.
         warmup_s: Time reading frames before returning from connect (in seconds)
 
     Note:
-        - Either name or serial_number must be specified.
+        - Exactly one of ``id`` or ``serial_number_or_name`` must be specified.
         - Depth stream configuration (if enabled) will use the same FPS as the color stream.
         - The actual resolution and FPS may be adjusted by the camera to the nearest supported mode.
         - For `fps`, `width` and `height`, either all of them need to be set, or none of them.
     """
 
-    serial_number_or_name: str
+    serial_number_or_name: str | None = None
     color_mode: ColorMode = ColorMode.RGB
     use_depth: bool = False
     rotation: Cv2Rotation = Cv2Rotation.NO_ROTATION
     warmup_s: int = 1
+    id: str | None = None
 
     def __post_init__(self) -> None:
         self.color_mode = ColorMode(self.color_mode)
         self.rotation = Cv2Rotation(self.rotation)
+
+        has_id = self.id is not None
+        has_serial = self.serial_number_or_name is not None
+        if has_id == has_serial:
+            raise ValueError(
+                "RealSenseCameraConfig requires exactly one of `id` (resolved via the camera "
+                "registry — see `lerobot-register-camera`) or `serial_number_or_name` (the "
+                "camera's serial number or human-readable name)."
+            )
 
         values = (self.fps, self.width, self.height)
         if any(v is not None for v in values) and any(v is None for v in values):

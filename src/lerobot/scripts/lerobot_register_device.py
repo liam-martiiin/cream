@@ -26,6 +26,14 @@ Example:
 lerobot-register-device --type so101_leader --name leader
 lerobot-register-device --type so101_follower --name follower
 ```
+
+Re-pairing a name to a new board (e.g. after swapping hardware) just means
+running the same command again and confirming the re-pair prompt. To drop a
+binding entirely::
+
+```shell
+lerobot-register-device --unregister --name leader
+```
 """
 
 from __future__ import annotations
@@ -38,7 +46,6 @@ from pathlib import Path
 from lerobot.utils.constants import HF_LEROBOT_CALIBRATION, ROBOTS, TELEOPERATORS
 from lerobot.utils.device_registry import (
     ConnectedBoard,
-    DeviceNameConflictError,
     DeviceRegistry,
     list_connected_boards,
 )
@@ -195,18 +202,30 @@ def register_device(robot_type: str, name: str, *, run_calibration: bool = True)
     if board is None:
         return 1
 
-    try:
-        registry.register(serial=board.serial_number, name=name, robot_type=robot_type)
-    except DeviceNameConflictError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
-
+    # `_choose_board` has already obtained the user's consent for any re-pair, so
+    # allow the name to move to the chosen board even if it was bound elsewhere.
+    registry.register(serial=board.serial_number, name=name, robot_type=robot_type, replace=True)
     registry.save()
     print(f'\n✓ Registered "{name}" → board {board.serial_number} ({board.port}).')
     print(f"  Saved to {registry.path}")
 
     if run_calibration:
         _maybe_launch_calibration(robot_type, name)
+    return 0
+
+
+def unregister_device(name: str) -> int:
+    """Remove the registry entry named ``name``. Returns process exit code."""
+    registry = DeviceRegistry.load()
+    existing = registry.find_by_name(name)
+    if existing is None:
+        print(f'No device named "{name}" is registered. Nothing to do.', file=sys.stderr)
+        return 1
+
+    registry.unregister(name)
+    registry.save()
+    print(f'✓ Unregistered "{name}" (was board {existing.serial} / {existing.robot_type}).')
+    print(f"  Saved to {registry.path}")
     return 0
 
 
@@ -218,9 +237,8 @@ def main() -> None:
     parser.add_argument(
         "--type",
         dest="robot_type",
-        required=True,
         choices=sorted(_SUPPORTED_TYPES),
-        help="Robot type to register (e.g. so101_leader, so101_follower).",
+        help="Robot type to register (e.g. so101_leader, so101_follower). Required unless --unregister.",
     )
     parser.add_argument(
         "--name",
@@ -228,11 +246,22 @@ def main() -> None:
         help='Friendly name to use thereafter (e.g. "leader", "follower", "left_arm").',
     )
     parser.add_argument(
+        "--unregister",
+        action="store_true",
+        help="Remove the registry entry for --name instead of pairing a board.",
+    )
+    parser.add_argument(
         "--no-calibrate",
         action="store_true",
         help="Skip the offer to launch lerobot-calibrate after registration.",
     )
     args = parser.parse_args()
+
+    if args.unregister:
+        sys.exit(unregister_device(args.name))
+
+    if args.robot_type is None:
+        parser.error("--type is required when registering a device.")
     sys.exit(register_device(args.robot_type, args.name, run_calibration=not args.no_calibrate))
 
 

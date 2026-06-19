@@ -248,3 +248,93 @@ def _assemble_grid(tiles, *, rows: int, cols: int):
     for r in range(rows):
         row_arrays.append(np.hstack(tiles[r * cols : (r + 1) * cols]))
     return np.vstack(row_arrays)
+
+
+# ---------------------------------------------------------------------------
+# Batch "view all + assign names" — a single snapshot of every camera shown in
+# the Rerun viewer. Works with headless OpenCV (no cv2.imshow) and opens its own
+# window, so there's nothing for the user to open manually.
+# ---------------------------------------------------------------------------
+
+_RERUN_GRID_ENTITY = "camera_picker/all_cameras"
+
+
+def _snapshot_grid(cameras: list[DiscoveredCamera]):
+    """Grab one frame per camera and assemble a numbered/captioned grid image.
+
+    Cameras with no V4L2 capture node (e.g. RealSense) render as a labeled
+    placeholder tile. Returns the grid (BGR ndarray) or ``None`` if cv2 is missing.
+    """
+    try:
+        import cv2  # noqa: F401
+    except Exception:
+        return None
+
+    captures = [_open_capture(cam) for cam in cameras]
+    try:
+        # Warm up: the first frames after opening are often black.
+        for cap in captures:
+            if cap is not None:
+                for _ in range(3):
+                    cap.read()
+        tiles = [
+            _render_tile(idx + 1, cam, cap)
+            for idx, (cam, cap) in enumerate(zip(cameras, captures, strict=False))
+        ]
+        cols, rows = _grid_shape(len(cameras))
+        return _assemble_grid(tiles, rows=rows, cols=cols)
+    finally:
+        for cap in captures:
+            if cap is not None:
+                cap.release()
+
+
+def _show_grid(grid) -> bool:
+    """Show ``grid`` in the Rerun viewer (auto-spawns it). False if Rerun is unavailable."""
+    if grid is None:
+        return False
+    try:
+        import rerun as rr
+    except Exception:
+        return False
+    rgb = grid[:, :, ::-1]  # tiles are BGR (OpenCV) → RGB for correct colors in Rerun
+    rr.init("lerobot camera picker", spawn=True)
+    rr.log(_RERUN_GRID_ENTITY, rr.Image(rgb))
+    return True
+
+
+def assign_names(cameras: list[DiscoveredCamera]) -> list[tuple[DiscoveredCamera, str]]:
+    """Show a snapshot grid of all cameras and prompt for a name per camera.
+
+    Returns ``(camera, name)`` pairs for the cameras the user named; a blank name skips
+    that camera. The visual grid is best-effort — if Rerun or a snapshot is unavailable,
+    naming still proceeds against the printed list.
+    """
+    from lerobot.utils.camera_registry import KIND_REALSENSE
+
+    if not cameras:
+        return []
+
+    shown = False
+    if os.environ.get("LEROBOT_HEADLESS_PICKER") != "1":
+        shown = _show_grid(_snapshot_grid(cameras))
+    if shown:
+        print("\nA snapshot of every camera opened in the Rerun viewer — match each index there.\n")
+    else:
+        print(
+            "\n(No live preview available. Install `lerobot[viz]` for an auto-opening "
+            "snapshot grid; naming from the list below.)\n"
+        )
+
+    for i, cam in enumerate(cameras, start=1):
+        ident = f"serial={cam.serial}" if cam.kind == KIND_REALSENSE else f"usb_path={cam.usb_path}"
+        label = "[RealSense] " if cam.kind == KIND_REALSENSE else ""
+        print(f"  [{i}] {label}{cam.model}  {ident}")
+    print()
+
+    assignments: list[tuple[DiscoveredCamera, str]] = []
+    for i, cam in enumerate(cameras, start=1):
+        name = input(f"Name for camera [{i}] {cam.model} (blank to skip): ").strip()
+        if name:
+            assignments.append((cam, name))
+    return assignments
