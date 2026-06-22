@@ -1,3 +1,10 @@
+<!-- LAB FORK NOTICE -->
+> **📦 SO-101 Lab fork.** This is a customized fork of Hugging Face LeRobot for our
+> bimanual SO-101 setup. For the commands we added (`lerobot-register-device`,
+> `lerobot-register-camera --all`, friendly-name arms/cameras, RealSense support)
+> and how they change the base kit, see **[`FORK_GUIDE.md`](./FORK_GUIDE.md)**.
+> Everything below is upstream LeRobot documentation.
+
 <p align="center">
   <img alt="LeRobot, Hugging Face Robotics Library" src="./media/readme/lerobot-logo-thumbnail.png" width="100%">
 </p>
