@@ -17,10 +17,18 @@
 from .config_so_follower import (
     SO100FollowerConfig,
     SO101FollowerConfig,
+    SO101SimplifiedFollowerConfig,
     SOFollowerConfig,
     SOFollowerRobotConfig,
+    SOSimplifiedFollowerHConfig, # added
+    SOSimplifiedFollowerPIDConfig #added
 )
 from .so_follower import SO100Follower, SO101Follower, SOFollower
+
+# Add this line to import your newly created hardware class:
+from .so_simplified_follower import SO101SimplifiedFollower, SOSimplifiedFollower
+from .so_simplified_follower_h import SOSimplifiedFollowerH # added
+from .so_simplified_follower_PID import SOSimplifiedFollowerPID # added
 
 __all__ = [
     "SO100Follower",
@@ -30,4 +38,16 @@ __all__ = [
     "SOFollower",
     "SOFollowerConfig",
     "SOFollowerRobotConfig",
+    "SO101SimplifiedFollower",
+    "SOSimplifiedFollower",
+    "SO101SimplifiedFollowerConfig",
+    "SOSimplifiedFollowerH", # added
+    "SOSimplifiedFollowerHConfig", # added
+    "SOSimplifiedFollowerPID", # added
+    "SOSimplifiedFollowerPIDConfig" # added
 ]
+
+
+
+
+

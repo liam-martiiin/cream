@@ -1,62 +1,17 @@
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""
-Simple script to control a robot from teleoperation.
-
-Requires: pip install 'lerobot[hardware]'
-
-Example:
-
-```shell
-lerobot-teleoperate \
-    --robot.type=so101_follower \
-    --robot.port=/dev/tty.usbmodem58760431541 \
-    --robot.cameras="{ front: {type: opencv, index_or_path: 0, width: 1920, height: 1080, fps: 30}}" \
-    --robot.id=black \
-    --teleop.type=so101_leader \
-    --teleop.port=/dev/tty.usbmodem58760431551 \
-    --teleop.id=blue \
-    --display_data=true
-```
-
-Example teleoperation with bimanual so100:
-
-```shell
-lerobot-teleoperate \
-  --robot.type=bi_so_follower \
-  --robot.left_arm_config.port=/dev/tty.usbmodem5A460822851 \
-  --robot.right_arm_config.port=/dev/tty.usbmodem5A460814411 \
-  --robot.id=bimanual_follower \
-  --robot.left_arm_config.cameras='{
-    wrist: {"type": "opencv", "index_or_path": 1, "width": 640, "height": 480, "fps": 30},
-  }' --robot.right_arm_config.cameras='{
-    wrist: {"type": "opencv", "index_or_path": 2, "width": 640, "height": 480, "fps": 30},
-  }' \
-  --teleop.type=bi_so_leader \
-  --teleop.left_arm_config.port=/dev/tty.usbmodem5A460852721 \
-  --teleop.right_arm_config.port=/dev/tty.usbmodem5A460819811 \
-  --teleop.id=bimanual_leader \
-  --display_data=true
-```
-
-"""
+# (License text omitted for brevity)
 
 import logging
 import time
+import threading
+import tkinter as tk
 from dataclasses import asdict, dataclass
 from pprint import pformat
+
+import cv2
+import numpy as np
+import torch
+from scipy.interpolate import splprep, splev
 
 from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense import RealSenseCameraConfig  # noqa: F401
@@ -109,24 +64,335 @@ from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import init_logging, move_cursor_up
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data, shutdown_rerun
 
+# ==========================================
+# --- SHARED STATE & THREADING ---
+# ==========================================
+
+SHARED_STATE = {
+    "cmd_capture_start": False,
+    "cmd_capture_end": False,
+    "cmd_run_eval": False,
+    "ui_msg": "",
+    "start_frame": None,
+    "end_frame": None,
+    "stop_teleop": False,
+    "eval_img_to_show": None  # Holds the finished dashboard for the main thread to display
+}
+
+# ==========================================
+# --- COMPUTER VISION EVALUATION SCRIPT ---
+# ==========================================
+
+MAX_TOLERANCE_PX = 30.0
+TOLERANCE_THRESHOLD_PX = 15.0
+LEFT_TRIM_PX = 30 
+EDGE_BUFFER_PX = 20
+
+def auto_crop_whiteboard(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+    _, thresh = cv2.threshold(blurred, 140, 255, cv2.THRESH_BINARY)
+    
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return 0, 0, img.shape[1], img.shape[0]
+        
+    largest_contour = max(contours, key=cv2.contourArea)
+    x, y, w, h = cv2.boundingRect(largest_contour)
+    
+    margin = 15
+    h_img, w_img = img.shape[:2]
+    
+    x1 = max(0, x + LEFT_TRIM_PX)
+    y1 = max(0, y - margin)
+    x2 = min(w_img, x + w + margin)
+    y2 = min(h_img, y + h + margin)
+    
+    return x1, y1, (x2 - x1), (y2 - y1)
+
+def get_estimated_curve(thresh_img):
+    contours, _ = cv2.findContours(thresh_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    h, w = thresh_img.shape
+    centroids = []
+    
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if 5 < area < 1000:
+            M = cv2.moments(cnt)
+            if M["m00"] > 0:
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+                if (cx > EDGE_BUFFER_PX and cx < (w - EDGE_BUFFER_PX) and 
+                    cy > EDGE_BUFFER_PX and cy < (h - EDGE_BUFFER_PX)):
+                    centroids.append((cx, cy))
+                
+    if len(centroids) < 3:
+        return thresh_img
+        
+    start_idx = np.argmin([p[1] for p in centroids])
+    sorted_pts = [centroids.pop(start_idx)]
+    
+    while centroids:
+        last = sorted_pts[-1]
+        dists = [np.linalg.norm(np.array(last) - np.array(p)) for p in centroids]
+        next_idx = np.argmin(dists)
+        sorted_pts.append(centroids.pop(next_idx))
+        
+    # Remove duplicate/overlapping points that cause SciPy to crash
+    clean_pts = [sorted_pts[0]]
+    for pt in sorted_pts[1:]:
+        if np.linalg.norm(np.array(pt) - np.array(clean_pts[-1])) > 5.0:
+            clean_pts.append(pt)
+    
+    sorted_pts = np.array(clean_pts)
+    curve_mask = np.zeros_like(thresh_img)
+    
+    if len(sorted_pts) < 2:
+        return thresh_img
+    
+    try:
+        k_val = min(3, len(sorted_pts) - 1)
+        tck, u = splprep([sorted_pts[:,0], sorted_pts[:,1]], s=0, k=k_val)
+        u_new = np.linspace(u.min(), u.max(), 1000)
+        x_new, y_new = splev(u_new, tck, der=0)
+        curve_points = np.vstack((x_new, y_new)).T.astype(np.int32)
+    except Exception as e:
+        print(f"Warning: Curve fitting failed ({e}).")
+        curve_points = sorted_pts
+    
+    cv2.polylines(curve_mask, [curve_points], False, 255, 3)
+    return curve_mask
+
+def evaluate_tracing(img_start, img_end):
+    gray_start = cv2.cvtColor(img_start, cv2.COLOR_BGR2GRAY)
+    gray_end = cv2.cvtColor(img_end, cv2.COLOR_BGR2GRAY)
+
+    _, thresh_start = cv2.threshold(gray_start, 100, 255, cv2.THRESH_BINARY_INV)
+    target_path = get_estimated_curve(thresh_start)
+
+    # Blur slightly to combat camera noise before taking the absolute difference
+    blur_start = cv2.GaussianBlur(gray_start, (3, 3), 0)
+    blur_end = cv2.GaussianBlur(gray_end, (3, 3), 0)
+    diff = cv2.absdiff(blur_end, blur_start)
+    
+    # Lowered threshold to 25 to catch faint ink from the camera feed
+    _, drawn_mask = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
+    
+    kernel_clean = np.ones((3, 3), np.uint8)
+    drawn_mask = cv2.morphologyEx(drawn_mask, cv2.MORPH_OPEN, kernel_clean)
+
+    contours, _ = cv2.findContours(drawn_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    clean_drawn_mask = np.zeros_like(drawn_mask)
+    for cnt in contours:
+        # Lowered area filter to 15 so thin/faint lines are not ignored
+        if cv2.contourArea(cnt) > 15: 
+            cv2.drawContours(clean_drawn_mask, [cnt], -1, 255, thickness=cv2.FILLED)
+    drawn_mask = clean_drawn_mask
+
+    h, w = drawn_mask.shape
+    drawn_mask[0:EDGE_BUFFER_PX, :] = 0
+    drawn_mask[h-EDGE_BUFFER_PX:h, :] = 0
+    drawn_mask[:, 0:EDGE_BUFFER_PX] = 0
+    drawn_mask[:, w-EDGE_BUFFER_PX:w] = 0
+
+    inv_target = cv2.bitwise_not(target_path)
+    dist_transform = cv2.distanceTransform(inv_target, cv2.DIST_L2, 5)
+    error_pixels = dist_transform[drawn_mask > 0]
+    
+    if len(error_pixels) == 0:
+        return 0, 0, 0.0, 0.0, target_path, drawn_mask
+        
+    mean_error = np.mean(error_pixels)
+    max_error = np.max(error_pixels)
+    accuracy_mean = max(0.0, 100.0 - ((mean_error / MAX_TOLERANCE_PX) * 100.0))
+    in_bounds_pixels = np.sum(error_pixels <= TOLERANCE_THRESHOLD_PX)
+    accuracy_in_bounds = (in_bounds_pixels / len(error_pixels)) * 100.0
+
+    return mean_error, max_error, accuracy_mean, accuracy_in_bounds, target_path, drawn_mask
+
+def create_dashboard(crop_start, crop_end, target_mask, drawn_mask, mean_err, max_err, acc_mean, acc_bounds):
+    # Fixed dashboard layout guarantees UI elements never overlap
+    PANEL_W, PANEL_H = 640, 640
+    FOOTER_H = 200
+    dash = np.ones((PANEL_H + FOOTER_H, PANEL_W * 2, 3), dtype=np.uint8) * 255
+    
+    radius = int(TOLERANCE_THRESHOLD_PX)
+    k_size = radius * 2 + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
+    tolerance_mask = cv2.dilate(target_mask, kernel)
+
+    left_panel = crop_start.copy()
+    left_overlay = left_panel.copy()
+    left_overlay[tolerance_mask > 0] = [170, 255, 170]
+    cv2.addWeighted(left_overlay, 0.4, left_panel, 0.6, 0, left_panel)
+    left_panel[target_mask > 0] = [0, 200, 0] 
+    
+    right_panel = crop_end.copy()
+    right_overlay = right_panel.copy()
+    right_overlay[tolerance_mask > 0] = [170, 255, 170] 
+    cv2.addWeighted(right_overlay, 0.4, right_panel, 0.6, 0, right_panel)
+    right_panel[target_mask > 0] = [0, 200, 0] 
+    
+    def resize_to_fit(img, max_w, max_h):
+        h, w = img.shape[:2]
+        scale = min(max_w / w, max_h / h)
+        new_w, new_h = int(w * scale), int(h * scale)
+        resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        
+        canvas = np.ones((max_h, max_w, 3), dtype=np.uint8) * 255
+        x_off = (max_w - new_w) // 2
+        y_off = (max_h - new_h) // 2
+        canvas[y_off:y_off+new_h, x_off:x_off+new_w] = resized
+        return canvas
+
+    left_fit = resize_to_fit(left_panel, PANEL_W, PANEL_H)
+    right_fit = resize_to_fit(right_panel, PANEL_W, PANEL_H)
+    
+    dash[0:PANEL_H, 0:PANEL_W] = left_fit
+    dash[0:PANEL_H, PANEL_W:PANEL_W*2] = right_fit
+    
+    cv2.line(dash, (PANEL_W, 0), (PANEL_W, PANEL_H), (0, 0, 0), 4)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    
+    cv2.rectangle(dash, (20, 10), (450, 100), (255, 255, 255), -1)
+    cv2.putText(dash, "FINAL TRACE", (40, 50), font, 1.2, (0, 0, 0), 3)
+    cv2.putText(dash, "(ESTIMATED CURVE)", (40, 90), font, 0.9, (50, 50, 50), 2)
+    
+    cv2.rectangle(dash, (PANEL_W + 20, 10), (PANEL_W + 450, 100), (255, 255, 255), -1)
+    cv2.putText(dash, "FINAL TRACE", (PANEL_W + 40, 50), font, 1.2, (0, 0, 0), 3)
+    cv2.putText(dash, "(ACTUAL RESULT)", (PANEL_W + 40, 90), font, 0.9, (50, 50, 50), 2)
+    
+    h = PANEL_H
+    w = PANEL_W
+    cv2.rectangle(dash, (0, h), (w * 2, h + FOOTER_H), (45, 40, 40), -1)
+    cv2.putText(dash, "PERFORMANCE EVALUATION:", (40, h + 50), font, 1.2, (200, 200, 200), 2)
+    cv2.putText(dash, f"MEAN SCORE:    {acc_mean:.1f}%", (40, h + 115), font, 1.5, (255, 255, 255), 3)
+    cv2.putText(dash, f"WITHIN {int(TOLERANCE_THRESHOLD_PX)}PX:    {acc_bounds:.1f}%", (40, h + 165), font, 1.5, (150, 255, 150), 3)
+    
+    box_x = int(w * 1.3)
+    cv2.rectangle(dash, (box_x, h + 30), (box_x + 350, h + FOOTER_H - 30), (60, 55, 55), -1)
+    cv2.rectangle(dash, (box_x, h + 30), (box_x + 350, h + FOOTER_H - 30), (100, 100, 100), 2)
+    
+    cv2.putText(dash, f"Mean Error: {mean_err:.2f} px", (box_x + 20, h + 75), font, 0.8, (255, 255, 255), 2)
+    cv2.putText(dash, f"Max Error:  {max_err:.2f} px", (box_x + 20, h + 115), font, 0.8, (255, 255, 255), 2)
+    
+    status_text = "PASS" if acc_bounds >= 85.0 else "FAIL"
+    status_color = (100, 200, 100) if status_text == "PASS" else (50, 50, 255)
+    cv2.putText(dash, status_text, (box_x + 200, h + 155), font, 1.2, status_color, 3)
+
+    return dash
+
+def convert_lerobot_to_cv2(img_data):
+    if hasattr(img_data, 'cpu'):
+        img_data = img_data.cpu().numpy()
+        
+    if img_data.ndim == 3 and img_data.shape[0] == 3:
+        img_data = np.transpose(img_data, (1, 2, 0))
+        
+    if img_data.dtype == np.float32 or img_data.dtype == np.float64:
+        if img_data.max() <= 1.0:
+            img_data = (img_data * 255).astype(np.uint8)
+            
+    return cv2.cvtColor(img_data, cv2.COLOR_RGB2BGR)
+
+def run_evaluation_from_memory(raw_start, raw_end):
+    print("\n--- Running Computer Vision Evaluation ---")
+    img_start = convert_lerobot_to_cv2(raw_start)
+    img_end = convert_lerobot_to_cv2(raw_end)
+    
+    x, y, w, h = auto_crop_whiteboard(img_start)
+    crop_start = img_start[y:y+h, x:x+w]
+    crop_end = img_end[y:y+h, x:x+w]
+    
+    mean_err, max_err, acc_mean, acc_bounds, target_mask, drawn_mask = evaluate_tracing(crop_start, crop_end)
+    dashboard_img = create_dashboard(crop_start, crop_end, target_mask, drawn_mask, mean_err, max_err, acc_mean, acc_bounds)
+    
+    print(f"Mean Score:      {acc_mean:.1f}%")
+    print(f"Within {int(TOLERANCE_THRESHOLD_PX)}px:      {acc_bounds:.1f}%")
+    
+    if dashboard_img.shape[0] > 800:
+        scale = 800 / dashboard_img.shape[0]
+        dashboard_img = cv2.resize(dashboard_img, (0,0), fx=scale, fy=scale)
+    
+    # Send the finished image buffer to the main thread to be displayed
+    SHARED_STATE["eval_img_to_show"] = dashboard_img
+    SHARED_STATE["ui_msg"] = "Evaluation Complete!"
+
+# ==========================================
+# --- TKINTER UI THREAD ---
+# ==========================================
+
+def start_ui_thread():
+    root = tk.Tk()
+    root.title("LeRobot Evaluator")
+    root.geometry("350x220")
+    root.configure(padx=20, pady=20)
+
+    title_label = tk.Label(root, text="Line Tracing Evaluator", font=("Helvetica", 14, "bold"))
+    title_label.pack(pady=(0, 15))
+
+    status_var = tk.StringVar(value="Status: Ready")
+    
+    def btn_start():
+        SHARED_STATE["cmd_capture_start"] = True
+        status_var.set("Status: Waiting to grab START frame...")
+        
+    def btn_end():
+        if SHARED_STATE["start_frame"] is None:
+            status_var.set("Status: Error! Capture START first.")
+            return
+            
+        SHARED_STATE["cmd_capture_end"] = True
+        status_var.set("Status: Capturing END & Evaluating...")
+
+    def on_closing():
+        SHARED_STATE["stop_teleop"] = True
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_closing)
+
+    tk.Button(root, text="1. Capture START Image", command=btn_start, width=25, height=2, bg="#e0e0e0").pack(pady=5)
+    tk.Button(root, text="2. Capture END & Evaluate", command=btn_end, width=25, height=2, bg="#4CAF50", fg="black").pack(pady=10)
+    
+    status_label = tk.Label(root, textvariable=status_var, font=("Helvetica", 10, "italic"), fg="blue")
+    status_label.pack(side=tk.BOTTOM)
+
+    def check_status():
+        if SHARED_STATE["ui_msg"]:
+            status_var.set(f"Status: {SHARED_STATE['ui_msg']}")
+            SHARED_STATE["ui_msg"] = ""
+            
+        if SHARED_STATE["cmd_run_eval"]:
+            SHARED_STATE["cmd_run_eval"] = False
+            threading.Thread(
+                target=run_evaluation_from_memory, 
+                args=(SHARED_STATE["start_frame"], SHARED_STATE["end_frame"]),
+                daemon=True
+            ).start()
+            
+        if SHARED_STATE["stop_teleop"]:
+            root.quit()
+            return
+            
+        root.after(100, check_status)
+
+    check_status()
+    root.mainloop()
+
+# ==========================================
+# --- TELEOPERATION LOGIC ---
+# ==========================================
 
 @dataclass
 class TeleoperateConfig:
-    # TODO: pepijn, steven: if more robots require multiple teleoperators (like lekiwi) its good to make this possibele in teleop.py and record.py with List[Teleoperator]
     teleop: TeleoperatorConfig
     robot: RobotConfig
-    # Limit the maximum frames per second.
     fps: int = 60
     teleop_time_s: float | None = None
-    # Display all cameras on screen
     display_data: bool = False
-    # Display data on a remote Rerun server
     display_ip: str | None = None
-    # Port of the remote Rerun server
     display_port: int | None = None
-    # Whether to  display compressed images in Rerun
     display_compressed_images: bool = False
-
 
 def teleop_loop(
     teleop: Teleoperator,
@@ -139,74 +405,100 @@ def teleop_loop(
     duration: float | None = None,
     display_compressed_images: bool = False,
 ):
-    """
-    This function continuously reads actions from a teleoperation device, processes them through optional
-    pipelines, sends them to a robot, and optionally displays the robot's state. The loop runs at a
-    specified frequency until a set duration is reached or it is manually interrupted.
-
-    Args:
-        teleop: The teleoperator device instance providing control actions.
-        robot: The robot instance being controlled.
-        fps: The target frequency for the control loop in frames per second.
-        display_data: If True, fetches robot observations and displays them in the console and Rerun.
-        display_compressed_images: If True, compresses images before sending them to Rerun for display.
-        duration: The maximum duration of the teleoperation loop in seconds. If None, the loop runs indefinitely.
-        teleop_action_processor: An optional pipeline to process raw actions from the teleoperator.
-        robot_action_processor: An optional pipeline to process actions before they are sent to the robot.
-        robot_observation_processor: An optional pipeline to process raw observations from the robot.
-    """
-
     display_len = max(len(key) for key in robot.action_features)
     start = time.perf_counter()
-    while True:
-        loop_start = time.perf_counter()
+    
+    cv_window_name = "ACT Policy Evaluation"
+    is_window_open = False
 
-        # Get robot observation
-        # Not really needed for now other than for visualization
-        # teleop_action_processor can take None as an observation
-        # given that it is the identity processor as default
-        obs = robot.get_observation()
+    try:
+        while not SHARED_STATE["stop_teleop"]:
+            loop_start = time.perf_counter()
+            obs = robot.get_observation()
 
-        if robot.name == "unitree_g1":
-            teleop.send_feedback(obs)
+            # --- 1. HANDLE UI CAPTURE TRIGGERS ---
+            if SHARED_STATE["cmd_capture_start"]:
+                if "topRight" in obs:
+                    frame = obs["topRight"]
+                    SHARED_STATE["start_frame"] = frame.clone() if hasattr(frame, 'clone') else frame.copy()
+                    SHARED_STATE["ui_msg"] = "Start Image Captured!"
+                    print("\n[EVALUATOR] Start image captured from memory.")
+                else:
+                    SHARED_STATE["ui_msg"] = "Error: 'topRight' camera not found."
+                SHARED_STATE["cmd_capture_start"] = False
+                
+            if SHARED_STATE["cmd_capture_end"]:
+                if "topRight" in obs:
+                    frame = obs["topRight"]
+                    SHARED_STATE["end_frame"] = frame.clone() if hasattr(frame, 'clone') else frame.copy()
+                    SHARED_STATE["ui_msg"] = "End Image Captured!"
+                    print("\n[EVALUATOR] End image captured. Running evaluation in background...")
+                    SHARED_STATE["cmd_run_eval"] = True 
+                else:
+                    SHARED_STATE["ui_msg"] = "Error: 'topRight' camera not found."
+                SHARED_STATE["cmd_capture_end"] = False
 
-        # Get teleop action
-        raw_action = teleop.get_action()
+            # --- 2. HANDLE TELEOPERATION ---
+            if robot.name == "unitree_g1":
+                teleop.send_feedback(obs)
 
-        # Process teleop action through pipeline
-        teleop_action = teleop_action_processor((raw_action, obs))
+            raw_action = teleop.get_action()
+            teleop_action = teleop_action_processor((raw_action, obs))
+            robot_action_to_send = robot_action_processor((teleop_action, obs))
+            _ = robot.send_action(robot_action_to_send)
 
-        # Process action for robot through pipeline
-        robot_action_to_send = robot_action_processor((teleop_action, obs))
-
-        # Send processed action to robot (robot_action_processor.to_output should return RobotAction)
-        _ = robot.send_action(robot_action_to_send)
-
-        if display_data:
-            # Process robot observation through pipeline
-            obs_transition = robot_observation_processor(obs)
-
-            log_rerun_data(
-                observation=obs_transition,
-                action=teleop_action,
-                compress_images=display_compressed_images,
-            )
+            if display_data:
+                obs_transition = robot_observation_processor(obs)
+                log_rerun_data(
+                    observation=obs_transition,
+                    action=teleop_action,
+                    compress_images=display_compressed_images,
+                )
 
             print("\n" + "-" * (display_len + 10))
             print(f"{'NAME':<{display_len}} | {'NORM':>7}")
             # Display the final robot action that was sent
             for motor, value in robot_action_to_send.items():
-                print(f"{motor:<{display_len}} | {value:>7.2f}")
+                    print(f"{motor:<{display_len}} | {value:>7.2f}")
+                
+                # Double-check this exact block is saved in your script
+            if "pressure" in obs:
+                print("-" * (display_len + 10))
+                print(f"{'PRESSURE':<{display_len}} | {obs['pressure']:>7.2f}")
             move_cursor_up(len(robot_action_to_send) + 3)
 
-        dt_s = time.perf_counter() - loop_start
-        precise_sleep(max(1 / fps - dt_s, 0.0))
-        loop_s = time.perf_counter() - loop_start
-        print(f"Teleop loop time: {loop_s * 1e3:.2f}ms ({1 / loop_s:.0f} Hz)")
-        move_cursor_up(1)
+            # --- 3. HANDLE OPEN-CV WINDOW IN MAIN THREAD ---
+            # This completely avoids Linux thread-locking issues.
+            if SHARED_STATE.get("eval_img_to_show") is not None:
+                cv2.imshow(cv_window_name, SHARED_STATE["eval_img_to_show"])
+                SHARED_STATE["eval_img_to_show"] = None
+                is_window_open = True
+                
+            if is_window_open:
+                try:
+                    # Check if user clicked the 'X' to close the OpenCV window
+                    if cv2.getWindowProperty(cv_window_name, cv2.WND_PROP_VISIBLE) < 1:
+                        is_window_open = False
+                    else:
+                        cv2.waitKey(1) # Keep window responsive (adds 1ms, safe for 60Hz loop)
+                except cv2.error:
+                    is_window_open = False
 
-        if duration is not None and time.perf_counter() - start >= duration:
-            return
+            # --- 4. MAINTAIN TIMING ---
+            dt_s = time.perf_counter() - loop_start
+            precise_sleep(max(1 / fps - dt_s, 0.0))
+            
+            # Print stats to terminal occasionally to avoid console spam
+            # loop_s = time.perf_counter() - loop_start
+            # print(f"Teleop loop time: {loop_s * 1e3:.2f}ms ({1 / loop_s:.0f} Hz)")
+            # move_cursor_up(1)
+
+            if duration is not None and time.perf_counter() - start >= duration:
+                break
+                
+    except KeyboardInterrupt:
+        print("\n\nTeleoperation interrupted by user (Ctrl+C).")
+        SHARED_STATE["stop_teleop"] = True
 
 
 @parser.wrap()
@@ -228,6 +520,9 @@ def teleoperate(cfg: TeleoperateConfig):
     teleop.connect()
     robot.connect()
 
+    ui_thread = threading.Thread(target=start_ui_thread, daemon=True)
+    ui_thread.start()
+
     try:
         teleop_loop(
             teleop=teleop,
@@ -240,19 +535,18 @@ def teleoperate(cfg: TeleoperateConfig):
             robot_observation_processor=robot_observation_processor,
             display_compressed_images=display_compressed_images,
         )
-    except KeyboardInterrupt:
-        pass
     finally:
         if cfg.display_data:
             shutdown_rerun()
+            
+        print("\nDisconnecting hardware safely...")
         teleop.disconnect()
         robot.disconnect()
-
+        cv2.destroyAllWindows()
 
 def main():
     register_third_party_plugins()
     teleoperate()
-
 
 if __name__ == "__main__":
     main()

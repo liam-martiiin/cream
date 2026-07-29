@@ -17,17 +17,31 @@
 from .config_so_leader import (
     SO100LeaderConfig,
     SO101LeaderConfig,
+    SO101SimplifiedLeaderConfig, # Added
     SOLeaderConfig,
     SOLeaderTeleopConfig,
+    SOSimplifiedLeaderHConfig, # Added
+    SOSimplifiedLeaderPIDConfig # Added
 )
 from .so_leader import SO100Leader, SO101Leader, SOLeader
+
+# Added hardware import
+from .so_simplified_leader import SO101SimplifiedLeader 
+from .so_simplified_leader_h import SOSimplifiedLeaderH # added
+from .so_simplified_leader_PID import SOSimplifiedLeaderPID # added
 
 __all__ = [
     "SO100Leader",
     "SO100LeaderConfig",
     "SO101Leader",
     "SO101LeaderConfig",
+    "SO101SimplifiedLeader",       # Added
+    "SO101SimplifiedLeaderConfig", # Added
     "SOLeader",
     "SOLeaderConfig",
     "SOLeaderTeleopConfig",
+    "SOSimplifiedLeaderH",       # Added
+    "SOSimplifiedLeaderHConfig", # Added
+    "SOSimplifiedLeaderPID",     # Added
+    "SOSimplifiedLeaderPIDConfig", # Added
 ]

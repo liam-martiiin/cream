@@ -443,7 +443,13 @@ class SerialMotorsBus(MotorsBusBase):
         if isinstance(values, (int | float)):
             return dict.fromkeys(self.ids, values)
         elif isinstance(values, dict):
-            return {self.motors[motor].id: val for motor, val in values.items()}
+            # Safe filter: Ignore any incoming motor keys (like 'gripper') 
+            # that are not defined in our actual hardware list.
+            return {
+                self.motors[motor].id: val 
+                for motor, val in values.items() 
+                if motor in self.motors
+            }
         else:
             raise TypeError(f"'values' is expected to be a single value or a dict. Got {values}")
 

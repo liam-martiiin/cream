@@ -6,3 +6,6 @@ __pycache__/
 data/
 outputs/
 wandb/
+output/
+.agents/
+src/lerobot/URDF/

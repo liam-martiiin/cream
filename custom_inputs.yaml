@@ -1,0 +1,18 @@
+policy:
+  type: act
+  input_features:
+    observation.state:
+      type: STATE
+      shape: [4]
+    observation.images.camera1:
+      type: VISUAL
+      shape: [3, 480, 640]
+    observation.images.camera2:
+      type: VISUAL
+      shape: [3, 480, 640]
+    observation.images.camera3:
+      type: VISUAL
+      shape: [3, 480, 640]
+    observation.pressure:
+      type: STATE
+      shape: [1]

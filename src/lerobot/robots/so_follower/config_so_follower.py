@@ -43,12 +43,36 @@ class SOFollowerConfig:
     use_degrees: bool = True
 
 
-@RobotConfig.register_subclass("so101_follower")
-@RobotConfig.register_subclass("so100_follower")
 @dataclass
 class SOFollowerRobotConfig(RobotConfig, SOFollowerConfig):
     pass
 
+@RobotConfig.register_subclass("so100_follower")
+@dataclass
+class SO100FollowerConfig(SOFollowerRobotConfig):
+    pass
 
-SO100FollowerConfig = SOFollowerRobotConfig
-SO101FollowerConfig = SOFollowerRobotConfig
+@RobotConfig.register_subclass("so101_follower")
+@dataclass
+class SO101FollowerConfig(SOFollowerRobotConfig):
+    pass
+
+@RobotConfig.register_subclass("so101_simplified_follower")
+@dataclass
+class SO101SimplifiedFollowerConfig(SOFollowerRobotConfig):
+    pass
+    
+@RobotConfig.register_subclass("so_simplified_follower_h")
+@dataclass
+class SOSimplifiedFollowerHConfig(SOFollowerRobotConfig):
+    pass
+
+@RobotConfig.register_subclass("so_simplified_follower_PID")
+@dataclass
+class SOSimplifiedFollowerPIDConfig(SOFollowerRobotConfig):
+    pass
+
+#SO100FollowerConfig = SOFollowerRobotConfig
+#SO101FollowerConfig = SOFollowerRobotConfig
+#SO101SimplifiedFollowerConfig = SO101SimplifiedFollowerConfig
+#SOSimplifiedFollowerHConfig = SOSimplifiedFollowerHConfig
