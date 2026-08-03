@@ -96,31 +96,47 @@ def hw_to_dataset_features(
     return features
 
 
-def build_dataset_frame(
-    ds_features: dict[str, dict], values: dict[str, Any], prefix: str
-) -> dict[str, np.ndarray]:
-    """Construct a single data frame from raw values based on dataset features.
-
-    A "frame" is a dictionary containing all the data for a single timestep,
-    formatted as numpy arrays according to the feature specification.
-
-    Args:
-        ds_features (dict): The LeRobot dataset features dictionary.
-        values (dict): A dictionary of raw values from the hardware/environment.
-        prefix (str): The prefix to filter features by (e.g., "observation"
-            or "action").
-
-    Returns:
-        dict: A dictionary representing a single frame of data.
-    """
+def build_dataset_frame(features: dict[str, dict], values: dict, prefix: str = "") -> dict:
     frame = {}
-    for key, ft in ds_features.items():
-        if key in DEFAULT_FEATURES or not key.startswith(prefix):
+    for key, ft in features.items():
+        # Only process observation features (those starting with `prefix`)
+        if not key.startswith(prefix):
             continue
-        elif ft["dtype"] == "float32" and len(ft["shape"]) == 1:
+
+        # For visual features, use the list of names
+        if ft.get("names") and ft.get("dtype") not in ("image", "video"):
             frame[key] = np.array([values[name] for name in ft["names"]], dtype=np.float32)
-        elif ft["dtype"] in ["image", "video"]:
-            frame[key] = values[key.removeprefix(f"{prefix}.images.")]
+            continue
+
+        # For non-visual features, try to get the value from `values`
+        value = None
+        if key in values:
+            value = values[key]
+        else:
+            # Attempt to fallback to a key without the extra prefix
+            # e.g., if key is "observation.images.observation.state", try "observation.state"
+            # Also try stripping "observation.images." prefix
+            alt_keys = [
+                key,  # original
+                key.removeprefix("observation.images."),  # strip the extra prefix
+                key.replace("observation.images.", ""),   # same
+            ]
+            for alt in alt_keys:
+                if alt in values:
+                    value = values[alt]
+                    break
+
+        if value is None:
+            raise KeyError(
+                f"Feature '{key}' not found in observation. "
+                f"Available keys: {list(values.keys())}"
+            )
+
+        # Only cast to float32 if it is NOT an image/video
+        if ft.get("dtype") in ("image", "video"):
+            frame[key] = value  # Leave as pristine uint8!
+        else:
+            frame[key] = np.array(value, dtype=np.float32)
 
     return frame
 

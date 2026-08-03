@@ -19,6 +19,7 @@ import time
 from functools import cached_property
 import serial
 import threading
+import numpy as np
 
 from lerobot.cameras import make_cameras_from_configs
 from lerobot.motors import Motor, MotorCalibration, MotorNormMode
@@ -80,20 +81,6 @@ class SOSimplifiedFollowerH(Robot):
             print(f"Warning: Could not connect to Arduino at {ARDUINO_PORT}: {e}")
 
     @property
-    def features(self) -> dict:
-        # 1. Grab the default features from the base LeRobot class
-        feats = super().features 
-        
-        # 2. Add your custom pressure feature so lerobot-record knows to save it
-        feats["observation.pressure"] = {
-            "dtype": "float32",
-            "shape": (1,),
-            "names": ["pressure"]
-        }
-        
-        return feats
-    
-    @property
     def _motors_ft(self) -> dict[str, type]:
         return {f"{motor}.pos": float for motor in self.bus.motors}
 
@@ -103,10 +90,14 @@ class SOSimplifiedFollowerH(Robot):
             cam: (self.config.cameras[cam].height, self.config.cameras[cam].width, 3) for cam in self.cameras
         }
 
+    #--- Replace the observation_features property ---
     @cached_property
     def observation_features(self) -> dict[str, type | tuple]:
-        return {**self._motors_ft, **self._cameras_ft}
-
+        return {
+            **self._cameras_ft,
+            **{f"{motor}.pos": float for motor in self.bus.motors},
+            "pressure": float,
+        }
     @cached_property
     def action_features(self) -> dict[str, type]:
         return self._motors_ft
@@ -207,38 +198,56 @@ class SOSimplifiedFollowerH(Robot):
             
     @check_if_not_connected
     def get_observation(self) -> RobotObservation:
-            
-        self.ser.reset_input_buffer()
-        
-        self.ser.write(b'P')
-        line = self.ser.readline().decode('utf-8').strip()
-
-        # Safely parse the float to prevent ValueError crashes from bad serial data
-        if line:
+        # --- Read pressure ---
+        if self.ser is not None:
             try:
-                self.current_pressure = float(line)
-            except ValueError:
-                logger.warning(f"Corrupted serial data received: '{line}'. Using previous pressure value.")
-                pass
-        
-        # Fallback just in case the very first read fails and the attribute doesn't exist yet
+                self.ser.reset_input_buffer()
+                self.ser.write(b'P')
+                line = self.ser.readline().decode('utf-8').strip()
+                if line:
+                    try:
+                        self.current_pressure = float(line)
+                    except ValueError:
+                        logger.warning(f"Corrupted serial data: '{line}'. Using previous pressure.")
+            except Exception as e:
+                logger.warning(f"Serial read error: {e}. Using previous pressure.")
+        else:
+            pass
+
         if not hasattr(self, 'current_pressure'):
             self.current_pressure = 0.0
- 
-        # Read arm position
-        start = time.perf_counter()
-        obs_dict = self.bus.sync_read("Present_Position")
-        
-        # Using Python 3.9+ dictionary union operator
-        obs_dict = {f"{motor}.pos": val for motor, val in obs_dict.items()} | {"pressure": self.current_pressure}
-        
-        dt_ms = (time.perf_counter() - start) * 1e3
-        logger.debug(f"{self} read state: {dt_ms:.1f}ms")
 
-        # Capture images from cameras
+        # --- Read motor positions ---
+        start = time.perf_counter()
+        raw_motor_dict = self.bus.sync_read("Present_Position")
+        
+
+        motor_names = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex"]
+        motor_positions_dict = {name: raw_motor_dict.get(name, 0.0) for name in motor_names}
+        motor_positions = list(motor_positions_dict.values())
+        
+
+        state_list = motor_positions + [self.current_pressure]
+
+        if len(state_list) != 5:
+            logger.warning(f"State list length is {len(state_list)}, expected 5. Padding with zeros.")
+            state_list = (state_list + [0.0] * 5)[:5]
+        state_array = np.array(state_list, dtype=np.float32)
+
+
+        # --- Build observation dict with full prefixed keys ---
+        obs_dict = {}
+        # Motor positions (these might be used by the rollout but not by the policy if not in features)
+        for name, val in motor_positions_dict.items():
+            obs_dict[f"{name}.pos"] = val
+        obs_dict["pressure"] = self.current_pressure
+        # State vector – now with the full key expected by the policy
+        obs_dict["observation.state"] = state_array
+
+        # Cameras – use the full prefix for each camera key
         for cam_key, cam in self.cameras.items():
             start = time.perf_counter()
-            obs_dict[cam_key] = cam.read_latest()
+            obs_dict[f"observation.images.{cam_key}"] = cam.read_latest()
             dt_ms = (time.perf_counter() - start) * 1e3
             logger.debug(f"{self} read {cam_key}: {dt_ms:.1f}ms")
 
