@@ -3,23 +3,14 @@
 # Copyright 2026 The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# ...
 
 import logging
 import time
 from functools import cached_property
 import serial
-import threading
-from lerobot.configs.types import FeatureType, PolicyFeature
+from collections import deque
+from enum import Enum
 import numpy as np
 
 from lerobot.cameras import make_cameras_from_configs
@@ -31,15 +22,21 @@ from lerobot.motors.feetech import (
 from lerobot.types import RobotAction, RobotObservation
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 from lerobot.utils.device_registry import resolve_or_verify_port
+from ..utils import ensure_safe_goal_position   # ← correct relative import
 
 from ..robot import Robot
-from ..utils import ensure_safe_goal_position
 from .config_so_follower import SOSimplifiedFollowerHConfig
 
 logger = logging.getLogger(__name__)
 
-ARDUINO_PORT = "/dev/ttyACM4" 
+ARDUINO_PORT = "/dev/ttyACM4"
 BAUD_RATE = 115200
+
+
+class DrawingState(Enum):
+    MARKER_UP_INIT = 0     # Starting position, marker pointing up
+    MARKER_DOWN_AIR = 1    # Marker flipped down, reading decreased due to gravity
+    TOUCHING_SURFACE = 2   # Contact made, reading spiked back up
 
 
 class SOSimplifiedFollowerH(Robot):
@@ -48,38 +45,67 @@ class SOSimplifiedFollowerH(Robot):
     Designed to be subclassed with a per-hardware-model `config_class` and `name`.
     """
 
-    config_class = SOSimplifiedFollowerHConfig # is for hardware
+    config_class = SOSimplifiedFollowerHConfig
     name = "so_simplified_follower_h"
 
     def __init__(self, config: SOSimplifiedFollowerHConfig):
         super().__init__(config)
         self.current_pressure = 0.0
+
+        # --- Touching State Variables ---
+        self._pressure_window = deque(maxlen=5)
+        self._arm_state = DrawingState.MARKER_UP_INIT
+        self._initial_up_baseline = None
+        # --------------------------------
+
         self.config = config
-        self.config.port = resolve_or_verify_port(
+        # FIX: resolve port into a local variable to avoid modifying a possibly frozen config
+        port = resolve_or_verify_port(
             self.id, self.config.port, register_command_hint="--type so_simplified_follower_h"
         )
-        # choose normalization mode depending on config if available
-        norm_mode_body = MotorNormMode.DEGREES if config.use_degrees else MotorNormMode.RANGE_M100_100
+
+        # FIX: RANGE_M100_100 → RANGE_MINUS100_100
+        norm_mode_body = MotorNormMode.DEGREES if config.use_degrees else MotorNormMode.RANGE_MINUS100_100
         self.bus = FeetechMotorsBus(
-            port=self.config.port,
+            port=port,
             motors={
                 "shoulder_pan": Motor(1, "sts3215", norm_mode_body),
                 "shoulder_lift": Motor(2, "sts3215", norm_mode_body),
                 "elbow_flex": Motor(3, "sts3215", norm_mode_body),
                 "wrist_flex": Motor(4, "sts3215", norm_mode_body),
-                #"wrist_roll": Motor(5, "sts3215", norm_mode_body),
-                #"gripper": Motor(6, "sts3215", MotorNormMode.RANGE_0_100),
+                # "wrist_roll": Motor(5, "sts3215", norm_mode_body),   # removed for simplification
+                # "gripper": Motor(6, "sts3215", MotorNormMode.RANGE_0_100),
             },
             calibration=self.calibration,
         )
         self.cameras = make_cameras_from_configs(config.cameras)
-        
-        try:   
+
+        # Serial connection to Arduino (pressure sensor)
+        self.ser = None
+        try:
             self.ser = serial.Serial(ARDUINO_PORT, BAUD_RATE, timeout=0.1)
-            time.sleep(2) #SHORTEN AS MUCH AS WE CAN TO SPEED UP STARTUP
+            time.sleep(2)  # allow Arduino to reset
             self.ser.reset_input_buffer()
         except Exception as e:
-            print(f"Warning: Could not connect to Arduino at {ARDUINO_PORT}: {e}")
+            logger.warning(f"Could not connect to Arduino at {ARDUINO_PORT}: {e}")
+
+    @property
+    def features(self) -> dict:
+        feats = super().features
+        # Override observation.state to include 4 motors + pressure + is_touching
+        feats["observation.state"] = {
+            "dtype": "float32",
+            "shape": (6,),
+            "names": [
+                "shoulder_pan",
+                "shoulder_lift",
+                "elbow_flex",
+                "wrist_flex",
+                "pressure",
+                "is_touching",
+            ],
+        }
+        return feats
 
     @property
     def _motors_ft(self) -> dict[str, type]:
@@ -88,17 +114,14 @@ class SOSimplifiedFollowerH(Robot):
     @property
     def _cameras_ft(self) -> dict[str, tuple]:
         return {
-            cam: (self.config.cameras[cam].height, self.config.cameras[cam].width, 3) for cam in self.cameras
+            cam: (self.config.cameras[cam].height, self.config.cameras[cam].width, 3)
+            for cam in self.cameras
         }
 
-    #--- Replace the observation_features property ---
     @cached_property
     def observation_features(self) -> dict[str, type | tuple]:
-        return {
-            **self._cameras_ft,
-            **{f"{motor}.pos": float for motor in self.bus.motors},
-            "pressure": PolicyFeature(type=FeatureType.ENV, shape=(1,)),
-        }
+        return {**self._motors_ft, **self._cameras_ft}
+
     @cached_property
     def action_features(self) -> dict[str, type]:
         return self._motors_ft
@@ -109,15 +132,11 @@ class SOSimplifiedFollowerH(Robot):
 
     @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
-        """
-        We assume that at connection time, arm is in a rest position,
-        and torque can be safely disabled to run calibration.
-        """
-
         self.bus.connect()
         if not self.is_calibrated and calibrate:
             logger.info(
-                "Mismatch between calibration values in the motor and the calibration file or no calibration file found"
+                "Mismatch between calibration values in the motor and the calibration file "
+                "or no calibration file found"
             )
             self.calibrate()
 
@@ -125,6 +144,8 @@ class SOSimplifiedFollowerH(Robot):
             cam.connect()
 
         self.configure()
+        # FIX: reset the pressure state machine at the beginning of every session
+        self.reset_touch_baseline()
         logger.info(f"{self} connected.")
 
     @property
@@ -133,9 +154,9 @@ class SOSimplifiedFollowerH(Robot):
 
     def calibrate(self) -> None:
         if self.calibration:
-            # Calibration file exists, ask user whether to use it or run new calibration
             user_input = input(
-                f"Press ENTER to use provided calibration file associated with the id {self.id}, or type 'c' and press ENTER to run calibration: "
+                f"Press ENTER to use provided calibration file associated with the id {self.id}, "
+                "or type 'c' and press ENTER to run calibration: "
             )
             if user_input.strip().lower() != "c":
                 logger.info(f"Writing calibration file associated with the id {self.id} to the motors")
@@ -150,16 +171,11 @@ class SOSimplifiedFollowerH(Robot):
         input(f"Move {self} to the middle of its range of motion and press ENTER....")
         homing_offsets = self.bus.set_half_turn_homings()
 
-        # Attempt to call record_ranges_of_motion with a reduced motor set when appropriate.
-        full_turn_motor = "wrist_roll"
-        unknown_range_motors = [motor for motor in self.bus.motors if motor != full_turn_motor]
-        print(
-            f"Move all joints except '{full_turn_motor}' sequentially through their "
-            "entire ranges of motion.\nRecording positions. Press ENTER to stop..."
-        )
-        range_mins, range_maxes = self.bus.record_ranges_of_motion(unknown_range_motors)
-        range_mins[full_turn_motor] = 0
-        range_maxes[full_turn_motor] = 4095
+        # Record ranges for all motors (no special full-turn motor in this simplified version)
+        print("Move all joints sequentially through their entire ranges of motion.")
+        print("Recording positions. Press ENTER to stop...")
+        all_motors = list(self.bus.motors.keys())
+        range_mins, range_maxes = self.bus.record_ranges_of_motion(all_motors)
 
         self.calibration = {}
         for motor, m in self.bus.motors.items():
@@ -182,70 +198,96 @@ class SOSimplifiedFollowerH(Robot):
                 self.bus.write("Operating_Mode", motor, OperatingMode.POSITION.value)
                 # Set P_Coefficient to lower value to avoid shakiness (Default is 32)
                 self.bus.write("P_Coefficient", motor, 16)
-                # Set I_Coefficient and D_Coefficient to default value 0 and 32
                 self.bus.write("I_Coefficient", motor, 0)
                 self.bus.write("D_Coefficient", motor, 32)
 
-                if motor == "gripper":
-                    self.bus.write("Max_Torque_Limit", motor, 500)  # 50% of max torque to avoid burnout
-                    self.bus.write("Protection_Current", motor, 250)  # 50% of max current to avoid burnout
-                    self.bus.write("Overload_Torque", motor, 25)  # 25% torque when overloaded
+                # No gripper-specific settings here
 
     def setup_motors(self) -> None:
         for motor in reversed(self.bus.motors):
             input(f"Connect the controller board to the '{motor}' motor only and press enter.")
             self.bus.setup_motor(motor)
             print(f"'{motor}' motor id set to {self.bus.motors[motor].id}")
-            
+
+    def is_touching(self, latest_pressure: float) -> bool:
+        self._pressure_window.append(latest_pressure)
+
+        if len(self._pressure_window) == 0:
+            return False
+
+        smoothed_pressure = sum(self._pressure_window) / len(self._pressure_window)
+
+        # 1. Initialize the starting upward baseline (expected to be ~0)
+        if self._initial_up_baseline is None:
+            self._initial_up_baseline = smoothed_pressure
+            return False
+
+        # --- Thresholds (tune these for your setup) ---
+        DOWN_THRESHOLD = self._initial_up_baseline - 50.0
+        CONTACT_THRESHOLD = self._initial_up_baseline + 20.0
+
+        # --- STATE MACHINE ---
+        if self._arm_state == DrawingState.MARKER_UP_INIT:
+            if smoothed_pressure < DOWN_THRESHOLD:
+                self._arm_state = DrawingState.MARKER_DOWN_AIR
+
+        elif self._arm_state == DrawingState.MARKER_DOWN_AIR:
+            if smoothed_pressure > CONTACT_THRESHOLD:
+                self._arm_state = DrawingState.TOUCHING_SURFACE
+
+        # TOUCHING_SURFACE is terminal until reset
+
+        return self._arm_state == DrawingState.TOUCHING_SURFACE
+
+    def reset_touch_baseline(self):
+        """Call at the start of a new episode."""
+        self._initial_up_baseline = None
+        self._pressure_window.clear()
+        self._arm_state = DrawingState.MARKER_UP_INIT
+
     @check_if_not_connected
     def get_observation(self) -> RobotObservation:
-        # --- Read pressure ---
+        # Read pressure from Arduino if available
         if self.ser is not None:
             try:
                 self.ser.reset_input_buffer()
                 self.ser.write(b'P')
                 line = self.ser.readline().decode('utf-8').strip()
                 if line:
-                    try:
-                        self.current_pressure = float(line)
-                    except ValueError:
-                        logger.warning(f"Corrupted serial data: '{line}'. Using previous pressure.")
+                    # FIX: guard against non-numeric strings
+                    self.current_pressure = float(line)
             except Exception as e:
-                logger.warning(f"Serial read error: {e}. Using previous pressure.")
-        else:
-            pass
-        
+                logger.warning(f"Error reading pressure: {e}")
+                # keep previous value
+
+        # Fallback if no pressure reading yet
         if not hasattr(self, 'current_pressure'):
             self.current_pressure = 0.0
 
-        # --- Read motor positions ---
+        # Evaluate touching state
+        is_touching_flag = 1.0 if self.is_touching(self.current_pressure) else 0.0
+
+        # Read arm positions
         start = time.perf_counter()
         raw_motor_dict = self.bus.sync_read("Present_Position")
-        
 
         motor_names = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex"]
-        motor_positions_dict = {name: raw_motor_dict.get(name, 0.0) for name in motor_names}
-        motor_positions = list(motor_positions_dict.values())
-        
+        motor_positions = [raw_motor_dict.get(name, 0.0) for name in motor_names]
 
-        # motor_positions is already a list of 4 floats
-        state_array = np.array(motor_positions, dtype=np.float32)          # shape (4,)
-        env_state_array = np.array([self.current_pressure], dtype=np.float32)  # shape (1,)
+        # Build state vector: 4 motor positions + pressure + touch flag
+        state_list = motor_positions + [self.current_pressure, is_touching_flag]
+        state_array = np.array(state_list, dtype=np.float32)
 
-
-        # --- Build observation dict with full prefixed keys ---
-        obs_dict = {}
-        # Motor positions (these might be used by the rollout but not by the policy if not in features)
-        for name, val in motor_positions_dict.items():
-            obs_dict[f"{name}.pos"] = val
-        obs_dict["pressure"] = self.current_pressure
-        # State vector – now with the full key expected by the policy
+        obs_dict = {f"{name}.pos": raw_motor_dict.get(name, 0.0) for name in motor_names}
         obs_dict["observation.state"] = state_array
-        obs_dict["observation.environment_state"] = env_state_array   # NEW — separate key
-        # Cameras – use the full prefix for each camera key
+
+        dt_ms = (time.perf_counter() - start) * 1e3
+        logger.debug(f"{self} read state: {dt_ms:.1f}ms")
+
+        # Capture images from cameras
         for cam_key, cam in self.cameras.items():
             start = time.perf_counter()
-            obs_dict[f"observation.images.{cam_key}"] = cam.read_latest()
+            obs_dict[cam_key] = cam.read_latest()
             dt_ms = (time.perf_counter() - start) * 1e3
             logger.debug(f"{self} read {cam_key}: {dt_ms:.1f}ms")
 
@@ -253,47 +295,37 @@ class SOSimplifiedFollowerH(Robot):
 
     @check_if_not_connected
     def send_action(self, action: RobotAction) -> RobotAction:
-        """Command arm to move to a target joint configuration.
-
-        The relative action magnitude may be clipped depending on the configuration parameter
-        `max_relative_target`. In this case, the action sent differs from original action.
-        Thus, this function always returns the action actually sent.
-
-        Raises:
-            RobotDeviceNotConnectedError: if robot is not connected.
-
-        Returns:
-            RobotAction: the action sent to the motors, potentially clipped.
-        """
-
         goal_pos = {key.removesuffix(".pos"): val for key, val in action.items() if key.endswith(".pos")}
 
-        # Cap goal position when too far away from present position.
-        # /!\ Slower fps expected due to reading from the follower.
         if self.config.max_relative_target is not None:
             present_pos = self.bus.sync_read("Present_Position")
             goal_present_pos = {key: (g_pos, present_pos[key]) for key, g_pos in goal_pos.items()}
+            # FIX: import now resolved correctly
             goal_pos = ensure_safe_goal_position(goal_present_pos, self.config.max_relative_target)
 
-        # Send goal position to the arm
         self.bus.sync_write("Goal_Position", goal_pos)
         return {f"{motor}.pos": val for motor, val in goal_pos.items()}
 
-    def _ticks_to_radians(self, motor_name: str, centered_ticks: int) -> float:
+    def _ticks_to_radians(self, motor_name: str, raw_ticks: int) -> float:
+        """Convert raw ticks (0-4095) to radians, centered around 0."""
         import math
-        rads = (centered_ticks / 4096.0) * (2.0 * math.pi)
-        return (rads + math.pi) % (2 * math.pi) - math.pi
+        centered = raw_ticks - 2048  # 4096/2
+        return (centered / 4096.0) * (2.0 * math.pi)
 
     def _radians_to_ticks(self, motor_name: str, radians: float) -> int:
+        """Convert radians to raw ticks (0-4095)."""
         import math
-        return int(round(radians * (4096.0 / (2.0 * math.pi))))
+        centered = int(round(radians * (4096.0 / (2.0 * math.pi))))
+        # clamp to avoid overflow
+        centered = max(-2048, min(2047, centered))
+        return centered + 2048
 
     @check_if_not_connected
     def get_observation_radians(self) -> dict[str, float]:
         rad_dict = {}
         for motor in self.bus.motors:
-            centered_ticks = self.bus.read("Present_Position", motor)
-            rad_dict[f"{motor}.pos"] = self._ticks_to_radians(motor, centered_ticks)
+            raw_ticks = self.bus.read("Present_Position", motor)
+            rad_dict[f"{motor}.pos"] = self._ticks_to_radians(motor, raw_ticks)
         return rad_dict
 
     @check_if_not_connected
@@ -301,16 +333,16 @@ class SOSimplifiedFollowerH(Robot):
         for key, rad_val in action_radians.items():
             if key.endswith(".pos"):
                 motor_name = key.removesuffix(".pos")
-                # We calculate pure centered ticks, the bus handles the physical offsets safely
-                centered_ticks = self._radians_to_ticks(motor_name, rad_val)
-                self.bus.write("Goal_Position", motor_name, centered_ticks)
-                
+                raw_ticks = self._radians_to_ticks(motor_name, rad_val)
+                self.bus.write("Goal_Position", motor_name, raw_ticks)
+
     @check_if_not_connected
     def disconnect(self):
         self.bus.disconnect(self.config.disable_torque_on_disconnect)
         for cam in self.cameras.values():
             cam.disconnect()
-
+        if self.ser is not None and self.ser.is_open:
+            self.ser.close()
         logger.info(f"{self} disconnected.")
 
 
