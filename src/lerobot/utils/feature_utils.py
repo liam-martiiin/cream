@@ -64,27 +64,30 @@ def hw_to_dataset_features(
         dict: A LeRobot features dictionary.
     """
     features = {}
-    joint_fts = {
+    state_fts = {
         key: ftype
         for key, ftype in hw_features.items()
-        if ftype is float or (isinstance(ftype, PolicyFeature) and ftype.type != FeatureType.VISUAL)
+        if ftype is float or (isinstance(ftype, PolicyFeature) and ftype.type == FeatureType.STATE)
+    }
+    env_fts = {
+        key: ftype
+        for key, ftype in hw_features.items()
+        if isinstance(ftype, PolicyFeature) and ftype.type == FeatureType.ENV
     }
     cam_fts = {key: shape for key, shape in hw_features.items() if isinstance(shape, tuple)}
 
-    if joint_fts and prefix == ACTION:
-        features[prefix] = {
-            "dtype": "float32",
-            "shape": (len(joint_fts),),
-            "names": list(joint_fts),
-        }
+    if state_fts and prefix == ACTION:
+        features[prefix] = {"dtype": "float32", "shape": (len(state_fts),), "names": list(state_fts)}
 
-    if joint_fts and prefix == OBS_STR:
-        features[f"{prefix}.state"] = {
-            "dtype": "float32",
-            "shape": (len(joint_fts),),
-            "names": list(joint_fts),
-        }
+    if state_fts and prefix == OBS_STR:
+        features[f"{prefix}.state"] = {"dtype": "float32", "shape": (len(state_fts),), "names": list(state_fts)}
 
+    if env_fts and prefix == OBS_STR:
+        features[f"{prefix}.environment_state"] = {
+            "dtype": "float32",
+            "shape": (len(env_fts),),
+            "names": list(env_fts),
+        }
     for key, shape in cam_fts.items():
         features[f"{prefix}.images.{key}"] = {
             "dtype": "video" if use_video else "image",

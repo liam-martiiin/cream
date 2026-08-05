@@ -19,6 +19,7 @@ import time
 from functools import cached_property
 import serial
 import threading
+from lerobot.configs.types import FeatureType, PolicyFeature
 import numpy as np
 
 from lerobot.cameras import make_cameras_from_configs
@@ -37,7 +38,7 @@ from .config_so_follower import SOSimplifiedFollowerHConfig
 
 logger = logging.getLogger(__name__)
 
-ARDUINO_PORT = "/dev/ttyACM0" 
+ARDUINO_PORT = "/dev/ttyACM4" 
 BAUD_RATE = 115200
 
 
@@ -96,7 +97,7 @@ class SOSimplifiedFollowerH(Robot):
         return {
             **self._cameras_ft,
             **{f"{motor}.pos": float for motor in self.bus.motors},
-            "pressure": float,
+            "pressure": PolicyFeature(type=FeatureType.ENV, shape=(1,)),
         }
     @cached_property
     def action_features(self) -> dict[str, type]:
@@ -213,7 +214,7 @@ class SOSimplifiedFollowerH(Robot):
                 logger.warning(f"Serial read error: {e}. Using previous pressure.")
         else:
             pass
-
+        
         if not hasattr(self, 'current_pressure'):
             self.current_pressure = 0.0
 
@@ -227,12 +228,9 @@ class SOSimplifiedFollowerH(Robot):
         motor_positions = list(motor_positions_dict.values())
         
 
-        state_list = motor_positions + [self.current_pressure]
-
-        if len(state_list) != 5:
-            logger.warning(f"State list length is {len(state_list)}, expected 5. Padding with zeros.")
-            state_list = (state_list + [0.0] * 5)[:5]
-        state_array = np.array(state_list, dtype=np.float32)
+        # motor_positions is already a list of 4 floats
+        state_array = np.array(motor_positions, dtype=np.float32)          # shape (4,)
+        env_state_array = np.array([self.current_pressure], dtype=np.float32)  # shape (1,)
 
 
         # --- Build observation dict with full prefixed keys ---
@@ -243,7 +241,7 @@ class SOSimplifiedFollowerH(Robot):
         obs_dict["pressure"] = self.current_pressure
         # State vector – now with the full key expected by the policy
         obs_dict["observation.state"] = state_array
-
+        obs_dict["observation.environment_state"] = env_state_array   # NEW — separate key
         # Cameras – use the full prefix for each camera key
         for cam_key, cam in self.cameras.items():
             start = time.perf_counter()

@@ -3,7 +3,10 @@ policy:
   input_features:
     observation.state:
       type: STATE
-      shape: [5]  # [joint_1, joint_2, joint_3, joint_4, pressure]
+      shape: [4]  # [joint_1, joint_2, joint_3, joint_4]
+    observation.environment_state:
+      type: ENV
+      shape: [1]  # [pressure]
     observation.images.camera1:
       type: VISUAL
       shape: [3, 480, 640]
